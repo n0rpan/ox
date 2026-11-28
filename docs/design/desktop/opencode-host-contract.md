@@ -32,4 +32,16 @@ The adapter lives in the host package and reuses its existing blocking HTTP tran
 cargo test --locked --manifest-path desktop/Cargo.toml -p ox-host --lib
 ```
 
-The unit tests exercise authenticated routes against a bounded loopback fixture. They cover owner partitioning, wrong-owner rejection, prompt model binding, history cursors, scoped SSE, and the cancellation fence after an ambiguous error. The stock fixture above separately verifies the wire contract and reported paths on Linux. The host still needs a child launcher tied to the gateway's route, checks against its durable session registry, a dedicated I/O worker, and desktop and phone projection tests. macOS needs its own runtime verification.
+The unit tests exercise authenticated routes against a bounded loopback fixture. They cover owner partitioning, wrong-owner rejection, prompt model binding, history cursors, scoped SSE, and the cancellation fence after an ambiguous error. The stock fixture separately verifies the wire contract and reported paths on Linux.
+
+## Route-owned child startup
+
+`Hosted::start` launches the OX helper from an I/O worker. The helper reuses the catalog, gateway, and launch configuration from `ox opencode`. It binds gateway inference to the exact model alias in the host's route and gives OpenCode the profile's four XDG roots. An exclusive lock ensures one owner can start that profile. The helper scopes ephemeral credentials to the local launch. OX retains the upstream keys.
+
+The helper reports the actual loopback listener and fresh Basic password over a private inherited Unix socket. The adapter verifies the version and the project, config, and state paths. Closing the control peer asks OpenCode to dispose its instances, including tracked tool processes in separate groups. The final fallback reaps the helper's private group. The host must still persist and verify ownership and cancellation state across host restarts.
+
+```sh
+python3 desktop/tests/opencode_host_bootstrap.py /path/to/opencode /path/to/ox
+```
+
+The Linux fixture occupies OpenCode's default TCP port, verifies the selected profile and authentication, rejects a duplicate launch, approves Bash to check that configured provider keys are absent, then closes the owner socket while a detached stock tool is running. It confirms the helper, server, and tool have exited. A helper or stock process killed before it can dispose its instances is a separate abrupt-failure case. This slice leaves host dispatch, durable receipt reconciliation, desktop and phone projection, and macOS verification to the integration PR.

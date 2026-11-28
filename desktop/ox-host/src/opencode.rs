@@ -2,11 +2,14 @@
 //! subscription is live only; a caller must reconcile history and approvals
 //! after disconnect. The OX host owns the durable session registry.
 
+mod bootstrap;
 mod events;
 mod profile;
+pub mod runtime;
 #[path = "../../../src/sse.rs"]
 mod sse;
 
+pub use bootstrap::Hosted;
 pub use events::{Event, Events};
 pub use profile::{Owner, Profile};
 
@@ -42,6 +45,11 @@ pub enum Error {
     NativeStatus(StatusCode),
     UnsupportedVersion(String),
     BlockedByCancellation,
+    UnknownSession,
+    TurnInProgress,
+    ConflictingSend,
+    AmbiguousSend,
+    RegistryUnavailable,
     UnknownPermission,
     Transport(reqwest::Error),
     Io(io::Error),
@@ -62,6 +70,19 @@ impl fmt::Display for Error {
             ),
             Self::BlockedByCancellation => {
                 out.write_str("OpenCode cancellation is still being reconciled")
+            }
+            Self::UnknownSession => {
+                out.write_str("OpenCode session is absent from this host route")
+            }
+            Self::TurnInProgress => out.write_str("An OpenCode turn is still in progress"),
+            Self::ConflictingSend => {
+                out.write_str("OpenCode send ID conflicts with the host receipt")
+            }
+            Self::AmbiguousSend => out.write_str(
+                "OpenCode did not confirm the send; reconcile or stop the turn before trying again",
+            ),
+            Self::RegistryUnavailable => {
+                out.write_str("OpenCode host registry must be reopened after a storage error")
             }
             Self::UnknownPermission => {
                 out.write_str("OpenCode permission is no longer pending in this session")
@@ -114,6 +135,7 @@ impl Session {
 struct NativeSession {
     id: String,
     directory: PathBuf,
+    permission: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -137,6 +159,8 @@ pub struct PermissionRequest {
     pub permission: String,
     pub patterns: Vec<String>,
     pub tool: Option<Value>,
+    #[serde(default)]
+    pub metadata: Value,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,18 +220,36 @@ impl Adapter {
     }
 
     pub fn create(&self, owner: &Owner, title: &str) -> Result<Session> {
+        self.create_with_permissions(owner, title, None)
+    }
+
+    fn create_with_permissions(
+        &self,
+        owner: &Owner,
+        title: &str,
+        permission: Option<Value>,
+    ) -> Result<Session> {
         self.check_owner(owner)?;
-        let native = self.json(
-            Method::POST,
-            &["session"],
-            &[],
-            Some(json!({ "title": title })),
-        )?;
+        let mut body = json!({ "title": title });
+        if let Some(permission) = &permission {
+            body["permission"] = permission.clone();
+        }
+        let native: NativeSession = self.json(Method::POST, &["session"], &[], Some(body))?;
+        check_permissions(native.permission.as_ref(), permission.as_ref())?;
         self.session(native)
     }
 
     /// Recover a session ID from the host's trusted durable registry.
     pub fn reopen_registered(&self, owner: &Owner, native_id: &str) -> Result<Session> {
+        self.reopen_with_permissions(owner, native_id, None)
+    }
+
+    fn reopen_with_permissions(
+        &self,
+        owner: &Owner,
+        native_id: &str,
+        permission: Option<Value>,
+    ) -> Result<Session> {
         self.check_owner(owner)?;
         check_id(native_id, "ses_")?;
         let native: NativeSession = self.json(Method::GET, &["session", native_id], &[], None)?;
@@ -216,6 +258,7 @@ impl Adapter {
                 "OpenCode returned a different session",
             ));
         }
+        check_permissions(native.permission.as_ref(), permission.as_ref())?;
         self.session(native)
     }
 
@@ -300,6 +343,15 @@ impl Adapter {
 
     pub fn events(&self, owner: &Owner, session: &Session) -> Result<Events> {
         let id = self.check_session(owner, session)?;
+        self.open_events(Some(id.to_owned()))
+    }
+
+    pub fn route_events(&self, owner: &Owner) -> Result<Events> {
+        self.check_owner(owner)?;
+        self.open_events(None)
+    }
+
+    fn open_events(&self, session: Option<String>) -> Result<Events> {
         let response = self.request(
             Method::GET,
             &["event"],
@@ -308,7 +360,7 @@ impl Adapter {
             StatusCode::OK,
             EVENT_TIMEOUT,
         )?;
-        Events::new(response, id.to_owned())
+        Events::new(response, session)
     }
 
     pub fn pending(&self, owner: &Owner, session: &Session) -> Result<Vec<PermissionRequest>> {
@@ -531,6 +583,15 @@ fn check_id(id: &str, prefix: &str) -> Result<()> {
         })
     {
         return Err(Error::InvalidInput("Invalid OpenCode identifier"));
+    }
+    Ok(())
+}
+
+fn check_permissions(actual: Option<&Value>, expected: Option<&Value>) -> Result<()> {
+    if expected.is_some() && actual != expected {
+        return Err(Error::InvalidResponse(
+            "OpenCode did not attest the host's session permissions",
+        ));
     }
     Ok(())
 }
