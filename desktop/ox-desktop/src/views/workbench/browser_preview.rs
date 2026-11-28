@@ -5,8 +5,9 @@ use crate::{
     kit::{button, col, row, small},
 };
 use gpui::{prelude::FluentBuilder, *};
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, RopeExt as _};
 use ox_desk_core::{
+    actions::Action,
     runtime::Runtime,
     store::{Connection, Store},
 };
@@ -35,6 +36,7 @@ struct Viewport {
     frame: Option<stream::Frame>,
     screenshot_supported: bool,
     capturing: bool,
+    reading_address: bool,
     error: Option<String>,
     needs_install: bool,
     installing: Option<Task<()>>,
@@ -42,8 +44,11 @@ struct Viewport {
     reader: Option<Task<()>>,
 }
 
-struct AddScreenshot(Arc<Vec<u8>>);
-impl EventEmitter<AddScreenshot> for Viewport {}
+enum AddEvidence {
+    Screenshot(Arc<Vec<u8>>),
+    PageAddress,
+}
+impl EventEmitter<AddEvidence> for Viewport {}
 
 fn session_label(route: &ox_desk_core::store::Route, thread: &str) -> String {
     let mut digest = Sha256::new();
@@ -224,26 +229,44 @@ impl Render for Viewport {
                                 .object_fit(ObjectFit::Contain),
                         ),
                 )
-                .when(self.screenshot_supported, |panel| {
-                    panel.child(row().justify_end().child(button(
-                        p,
-                        "browser-preview-evidence",
-                        if self.capturing {
-                            "Adding screenshot…"
-                        } else {
-                            "Add screenshot"
-                        },
-                        true,
-                        !self.capturing && self.stopping.is_none(),
-                        cx.listener(|s, _, _, cx| {
-                            if let Some(frame) = &s.frame
-                                && !s.capturing
-                            {
-                                cx.emit(AddScreenshot(frame.jpeg.clone()));
-                            }
+                .child(
+                    row()
+                        .flex_wrap()
+                        .gap_2()
+                        .justify_end()
+                        .child(button(
+                            p,
+                            "browser-preview-page-address",
+                            if self.reading_address {
+                                "Reading page address…"
+                            } else {
+                                "Add page address"
+                            },
+                            !self.screenshot_supported,
+                            !self.reading_address && self.stopping.is_none(),
+                            cx.listener(|_, _, _, cx| cx.emit(AddEvidence::PageAddress)),
+                        ))
+                        .when(self.screenshot_supported, |actions| {
+                            actions.child(button(
+                                p,
+                                "browser-preview-evidence",
+                                if self.capturing {
+                                    "Adding screenshot…"
+                                } else {
+                                    "Add screenshot"
+                                },
+                                true,
+                                !self.capturing && self.stopping.is_none(),
+                                cx.listener(|s, _, _, cx| {
+                                    if let Some(frame) = &s.frame
+                                        && !s.capturing
+                                    {
+                                        cx.emit(AddEvidence::Screenshot(frame.jpeg.clone()));
+                                    }
+                                }),
+                            ))
                         }),
-                    )))
-                })
+                )
                 .children(self.error.as_ref().map(|error| small(p, error.clone())));
             return crate::platform::layout_probe::mark_element(
                 panel,
@@ -432,14 +455,118 @@ impl Workbench {
                 };
                 // The bounded viewport JPEG is already smaller than the local paste limit.
                 store.attach_image(Some(&owner), image);
-                if preview.expanded || s.pane_width < px(500. + WIDTH) {
-                    s.clear_browser_preview(Some(window), cx);
-                }
-                s.focus_editor_for = Some(Some(owner));
-                cx.notify();
+                let expanded = preview.expanded;
+                s.focus_preview_draft(owner, expanded, window, cx);
             });
         })
         .detach();
+    }
+
+    fn stage_browser_address(
+        &mut self,
+        generation: EntityId,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(owner) = self.browser_owner().map(str::to_owned) else {
+            return;
+        };
+        let Some(preview) = self
+            .browser_preview
+            .as_ref()
+            .filter(|preview| preview.viewport.entity_id() == generation && preview.owner == owner)
+        else {
+            return;
+        };
+        if !self
+            .store
+            .as_ref()
+            .is_some_and(|store| store.can_compose(Some(&owner)))
+        {
+            preview.viewport.update(cx, |viewport, cx| {
+                viewport.error =
+                    Some("Wait for the composer to be ready, then add the page address.".into());
+                cx.notify();
+            });
+            return;
+        }
+        let (project, label) = preview.viewport.update(cx, |viewport, cx| {
+            viewport.reading_address = true;
+            viewport.error = None;
+            cx.notify();
+            (viewport.project.clone(), viewport.label.clone())
+        });
+        let read =
+            cx.background_spawn(
+                async move { crate::platform::browser::page_address(&project, &label) },
+            );
+        cx.spawn_in(window, async move |view, cx| {
+            let result = read.await;
+            let _ = view.update_in(cx, |s, window, cx| {
+                let Some(preview) = s.browser_preview.as_ref().filter(|preview| {
+                    preview.viewport.entity_id() == generation
+                        && preview.owner == owner
+                        && s.browser_owner() == Some(owner.as_str())
+                }) else {
+                    return;
+                };
+                preview.viewport.update(cx, |viewport, cx| {
+                    viewport.reading_address = false;
+                    viewport.error = result.as_ref().err().cloned();
+                    cx.notify();
+                });
+                let Ok(address) = result else { return };
+                let Some(store) = s
+                    .store
+                    .as_ref()
+                    .filter(|store| store.can_compose(Some(&owner)))
+                else {
+                    return;
+                };
+                let expanded = preview.expanded;
+                let draft_key = Some(owner.clone());
+                let current = store.draft(Some(&owner));
+                let insertion = format!(
+                    "{}Page address: {address}\n",
+                    if current.is_empty() {
+                        ""
+                    } else if current.ends_with('\n') {
+                        "\n"
+                    } else {
+                        "\n\n"
+                    },
+                );
+                let next = format!("{current}{insertion}");
+                if let Some(editor) = s.editors.get(&draft_key)
+                    && editor.read(cx).value().as_ref() == current
+                {
+                    let position = editor.read(cx).text().offset_to_position(current.len());
+                    editor.update(cx, |editor, cx| {
+                        if editor.marked_text_range(window, cx).is_none() {
+                            editor.set_cursor_position(position, window, cx);
+                            editor.insert(insertion, window, cx);
+                        }
+                    });
+                }
+                s.action(cx, Action::DraftEdit(draft_key, next));
+                s.focus_preview_draft(owner, expanded, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn focus_preview_draft(
+        &mut self,
+        owner: String,
+        expanded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if expanded || self.pane_width < px(500. + WIDTH) {
+            self.clear_browser_preview(Some(window), cx);
+        }
+        self.focus_editor_for = Some(Some(owner));
+        cx.notify();
     }
 
     fn browser_owner(&self) -> Option<&str> {
@@ -496,6 +623,7 @@ impl Workbench {
                 frame: None,
                 screenshot_supported,
                 capturing: false,
+                reading_address: false,
                 error: None,
                 needs_install: false,
                 installing: None,
@@ -508,8 +636,11 @@ impl Workbench {
         let evidence = cx.subscribe_in(
             &viewport,
             window,
-            |s, view, event: &AddScreenshot, window, cx| {
-                s.stage_browser_screenshot(view.entity_id(), event.0.clone(), window, cx);
+            |s, view, event: &AddEvidence, window, cx| match event {
+                AddEvidence::Screenshot(bytes) => {
+                    s.stage_browser_screenshot(view.entity_id(), bytes.clone(), window, cx);
+                }
+                AddEvidence::PageAddress => s.stage_browser_address(view.entity_id(), window, cx),
             },
         );
         let focus = cx.focus_handle();
