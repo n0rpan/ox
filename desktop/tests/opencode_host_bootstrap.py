@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -35,7 +36,8 @@ class CredentialProvider(Provider):
         })
         if case == "credential check":
             command = (
-                'if [ -z "${FIXTURE_PROVIDER_KEY+x}" ] && [ -z "${SECOND_PROVIDER_KEY+x}" ]; '
+                'if [ -z "${FIXTURE_PROVIDER_KEY+x}" ] && [ -z "${SECOND_PROVIDER_KEY+x}" ] '
+                '&& [ -z "${CODEOX_TOKEN+x}" ]; '
                 "then printf clean; else printf leaked; fi > credential-check.txt"
             )
         else:
@@ -108,6 +110,7 @@ def run(ox, opencode, root, provider):
     env = {
         "PATH": os.pathsep.join((str(bin_dir), os.defpath)), "HOME": str(home), "CODEX_HOME": str(home),
         "LANG": "C", "FIXTURE_PROVIDER_KEY": provider.key, "SECOND_PROVIDER_KEY": secrets.token_urlsafe(24),
+        "CODEOX_TOKEN": "previous-launch-token",
         # Overrides from a previous stock launch must not redirect hosted data, config, or HTTP auth.
         "OPENCODE_SERVER_USERNAME": "old-user", "OPENCODE_SERVER_PASSWORD": "old-password",
         "OPENCODE_DB": str(root / "wrong.db"), "OPENCODE_CONFIG_CONTENT": '{"model":"wrong/model"}',
@@ -135,8 +138,12 @@ def run(ox, opencode, root, provider):
             assert paths["directory"] == str(project)
             assert paths["config"] == str(profile / "config/opencode")
             assert paths["state"] == str(profile / "state/opencode")
-            config = next((profile / "config").glob(".ox-open-*/opencode.json")).read_text()
-            assert set(json.loads(config)["provider"]["ox"]["models"]) == {MODEL}
+            launch_config = next((profile / "config").glob(".ox-open-*/opencode.json"))
+            config = launch_config.read_text()
+            provider_config = json.loads(config)["provider"]["ox"]
+            assert set(provider_config["models"]) == {MODEL}
+            assert provider_config["env"] == [] and provider_config["options"]["apiKey"] == "{file:.ox-relay-token}"
+            assert stat.S_IMODE(launch_config.with_name(".ox-relay-token").stat().st_mode) == 0o600
             assert provider.key not in config and env["SECOND_PROVIDER_KEY"] not in config
 
             with managed(ox, env, project) as (duplicate, contender):
@@ -178,7 +185,7 @@ def run(ox, opencode, root, provider):
             with closing(socket.socket()) as probe:
                 assert probe.connect_ex(("127.0.0.1", endpoint.port)) != 0
             assert not list((profile / "config").glob(".ox-open-*"))
-        print("Verified assigned loopback, exact profile and model, provider-key isolation, exclusive ownership, and teardown with a detached tool still running.")
+        print("Verified assigned loopback, exact profile and model, provider and relay key isolation, exclusive ownership, and teardown with a detached tool still running.")
 
 
 def main():

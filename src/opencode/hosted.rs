@@ -84,13 +84,19 @@ pub(crate) async fn run(home: &Path) -> Result<u8, RelayError> {
     }
     relay.prewarm(model);
     clients::prepare_opencode_profile(&launch.profile)?;
-    let (listener, config) =
-        launch_config(&launch.profile, &relay, &BTreeSet::from([model]), model).await?;
+    let (listener, config) = launch_config(
+        &launch.profile,
+        &relay,
+        &BTreeSet::from([model]),
+        model,
+        Some(&token),
+    )
+    .await?;
     let password = crate::random_token()?;
     let mut term = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     let args = ["serve", "--hostname", "127.0.0.1", "--port", "0"].map(Into::into);
-    let mut child = command(&args, &launch.profile, env_refs, token, &config)
+    let mut child = command(&args, &launch.profile, env_refs, None, &config)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .env("OPENCODE_SERVER_USERNAME", "opencode")
