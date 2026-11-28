@@ -84,3 +84,17 @@ test("a draft notification opens only its still-live request on the owning route
     await target.resolve(rows, {complete: true}, (result) => assert.deepEqual(result, expected));
   }
 });
+
+test("a qualified request keeps its digest after resolving the owning session", async () => {
+  const target = new NotificationTarget();
+  const digest = createHash("sha256").update("fixture request token").digest("base64url");
+  for (const [ref, expected] of [
+    [`${link(second)}~ask=${digest}`, { ...second, requestDigest: digest }],
+    [`${link(second)}~ask=invalid`, "missing"],
+    [`duplicate~ask=${digest}`, "missing"],
+  ]) {
+    target.request(ref);
+    await target.resolve([first, second], { complete: true },
+      (value) => assert.deepEqual(value, expected));
+  }
+});

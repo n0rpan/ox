@@ -13,10 +13,23 @@ export const emptyScope = (scope) => ({
   detail: {},
 });
 const sessionKey = (scope, id) => scopeKey(scope) + " " + id;
+const digestPattern = /^[a-zA-Z0-9_-]{43}$/;
+export async function targetDigest(value) {
+  const bytes = new TextEncoder().encode(value);
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return btoa(String.fromCharCode(...hash))
+    .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
+}
 // A Web Push reference includes the SHA-256 digest of the same four fields as
 // push.rs. Older notifications carry only the native session id.
 async function notificationMatch(ref, rows, complete) {
-  const cut = ref.lastIndexOf("~");
+  const last = ref.lastIndexOf("~");
+  const requestDigest = last >= 0 && ref.startsWith("ask=", last + 1)
+    ? ref.slice(last + 5)
+    : null;
+  if (requestDigest != null && !digestPattern.test(requestDigest)) return "missing";
+  const cut = requestDigest == null ? last : ref.lastIndexOf("~", last - 1);
+  if (requestDigest != null && cut < 0) return "missing";
   const id = cut < 0 ? ref : ref.slice(0, cut);
   const candidates = rows.filter(({ session, request }) => session ? session.id === id : cut >= 0 && id === `ask:${request}`);
   if (cut < 0) {
@@ -24,16 +37,13 @@ async function notificationMatch(ref, rows, complete) {
     if (!complete) return "incomplete";
     return candidates[0] ?? "missing";
   }
-  const signature = ref.slice(cut + 1);
-  if (!id || !/^[a-zA-Z0-9_-]{43}$/.test(signature)) return "missing";
+  const signature = ref.slice(cut + 1, requestDigest == null ? ref.length : last);
+  if (!id || !digestPattern.test(signature)) return "missing";
   for (const row of candidates) {
     const { project, route } = row.scope;
     const alias = typeof route.billing === "string" ? null : route.billing.api;
-    const bytes = new TextEncoder().encode(JSON.stringify([project, route.runtime, alias, id]));
-    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-    const hash = btoa(String.fromCharCode(...digest))
-      .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
-    if (hash === signature) return row;
+    const hash = await targetDigest(JSON.stringify([project, route.runtime, alias, id]));
+    if (hash === signature) return requestDigest == null ? row : { ...row, requestDigest };
   }
   return complete ? "missing" : "incomplete";
 }
