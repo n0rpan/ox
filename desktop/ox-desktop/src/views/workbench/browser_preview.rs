@@ -38,6 +38,7 @@ struct Viewport {
     error: Option<String>,
     needs_install: bool,
     installing: Option<Task<()>>,
+    stopping: Option<Task<()>>,
     reader: Option<Task<()>>,
 }
 
@@ -53,7 +54,7 @@ fn session_label(route: &ox_desk_core::store::Route, thread: &str) -> String {
 
 impl Viewport {
     fn start(&mut self, url: Option<String>, window: &Window, cx: &mut Context<Self>) {
-        if self.reader.is_some() || self.installing.is_some() {
+        if self.reader.is_some() || self.installing.is_some() || self.stopping.is_some() {
             return;
         }
         self.error = None;
@@ -108,6 +109,35 @@ impl Viewport {
         cx.notify();
     }
 
+    fn stop(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.frame.is_none() || self.stopping.is_some() {
+            return;
+        }
+        self.error = None;
+        let project = self.project.clone();
+        let label = self.label.clone();
+        let stop =
+            cx.background_spawn(async move { crate::platform::browser::close(&project, &label) });
+        self.stopping = Some(cx.spawn_in(window, async move |view, cx| {
+            let result = stop.await;
+            let _ = view.update_in(cx, |viewport, window, cx| {
+                viewport.stopping = None;
+                viewport.error = Some(match result {
+                    Ok(()) => {
+                        viewport.reader = None;
+                        if let Some(old) = viewport.frame.take() {
+                            let _ = window.drop_image(old.image);
+                        }
+                        "Browser stopped.".into()
+                    }
+                    Err(error) => error,
+                });
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+
     fn install(&mut self, window: &Window, cx: &mut Context<Self>) {
         if !self.needs_install || self.installing.is_some() {
             return;
@@ -149,17 +179,35 @@ impl Render for Viewport {
                         .justify_between()
                         .gap_x_2()
                         .child(small(p, "Live · View only"))
-                        .child(button(
-                            p,
-                            "browser-preview-copy-agent",
-                            "Copy agent command",
-                            false,
-                            true,
-                            cx.listener(|s, _, _, cx| {
-                                let command = format!("ox browser --session {} snapshot", s.label);
-                                cx.write_to_clipboard(ClipboardItem::new_string(command));
-                            }),
-                        )),
+                        .child(
+                            row()
+                                .flex_wrap()
+                                .gap_x_2()
+                                .child(button(
+                                    p,
+                                    "browser-preview-copy-agent",
+                                    "Copy agent command",
+                                    false,
+                                    self.stopping.is_none(),
+                                    cx.listener(|s, _, _, cx| {
+                                        let command =
+                                            format!("ox browser --session {} snapshot", s.label);
+                                        cx.write_to_clipboard(ClipboardItem::new_string(command));
+                                    }),
+                                ))
+                                .child(button(
+                                    p,
+                                    "browser-preview-stop",
+                                    if self.stopping.is_some() {
+                                        "Stopping browser…"
+                                    } else {
+                                        "Stop browser"
+                                    },
+                                    false,
+                                    self.stopping.is_none(),
+                                    cx.listener(|s, _, window, cx| s.stop(window, cx)),
+                                )),
+                        ),
                 )
                 .child(
                     col()
@@ -186,7 +234,7 @@ impl Render for Viewport {
                             "Add screenshot"
                         },
                         true,
-                        !self.capturing,
+                        !self.capturing && self.stopping.is_none(),
                         cx.listener(|s, _, _, cx| {
                             if let Some(frame) = &s.frame
                                 && !s.capturing
@@ -232,13 +280,15 @@ impl Render for Viewport {
                 )))
                 .into_any_element();
         }
-        let tip = if let Some(error) = &self.error {
+        let tip = if self.stopping.is_some() {
+            small(p, "Stopping browser…")
+        } else if let Some(error) = &self.error {
             small(p, error.clone())
         } else {
             small(p, "Connecting to this session’s browser…")
         };
         let address = self.address.read(cx).value();
-        let busy = self.reader.is_some();
+        let busy = self.reader.is_some() || self.stopping.is_some();
         let agent_url = if address.trim().is_empty() {
             "http://127.0.0.1:3000"
         } else {
@@ -449,6 +499,7 @@ impl Workbench {
                 error: None,
                 needs_install: false,
                 installing: None,
+                stopping: None,
                 reader: None,
             };
             view.start(None, window, cx);

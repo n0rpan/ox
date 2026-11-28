@@ -40,6 +40,18 @@ pub(crate) fn open(project: &Path, label: &str, url: &str) -> Result<(), String>
     Err(command_error(output, "Could not open the local browser."))
 }
 
+pub(crate) fn close(project: &Path, label: &str) -> Result<(), String> {
+    let output = command(project, label)
+        .arg("close")
+        .output()
+        .map_err(|error| format!("Could not stop the browser session. {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(command_error(output, "Could not stop the browser session."))
+    }
+}
+
 pub(crate) fn install() -> Result<(), String> {
     let output = Command::new(super::ox())
         .args(["browser", "install"])
