@@ -25,6 +25,7 @@ mod host_lifetime;
 mod managed_install;
 mod memory_cli;
 mod native;
+mod opencode;
 mod picker;
 mod provider;
 mod ps;
@@ -210,6 +211,7 @@ async fn launch(args: impl Iterator<Item = OsString>) -> Result<u8, RelayError> 
         }
         Some("setup") => return run_setup(&args[1..], &codex_home).await,
         Some("serve") => return daemon::run(&args[1..], &codex_home).await,
+        Some("opencode") => return opencode::run(&args[1..], &codex_home).await,
         Some("doctor") if args.iter().any(|arg| arg == "--live") => {
             return diagnostics::run(&args[1..], &codex_home).await;
         }
@@ -504,7 +506,8 @@ fn exempt_loopback_proxy(command: &mut Command) {
 const NO_PROVIDER: &str = "no ox API provider configured. Run `ox setup` to add one, or `ox help subscriptions` for native sign-in";
 
 const OX_COMMANDS: &[&str] = &[
-    "setup", "doctor", "provider", "serve", "update", "weather", "login", "help", "codex", "claude",
+    "setup", "doctor", "provider", "serve", "update", "weather", "login", "help", "codex",
+    "claude", "opencode",
 ];
 /// Stock Codex subcommands that `ox <word>` forwards unchanged.
 const CODEX_COMMANDS: &[&str] = &[
