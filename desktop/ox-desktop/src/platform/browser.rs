@@ -78,6 +78,30 @@ fn command_error(output: Output, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.into())
 }
 
+pub(crate) fn page_address(project: &Path, label: &str) -> Result<String, String> {
+    let output = command(project, label)
+        .arg("url")
+        .output()
+        .map_err(|error| format!("Could not read the page address. {error}"))?;
+    if !output.status.success() {
+        return Err(
+            "Could not read the page address. Check that the browser is still open.".into(),
+        );
+    }
+    let address = std::str::from_utf8(&output.stdout)
+        .ok()
+        .and_then(|text| {
+            text.strip_suffix("\r\n")
+                .or_else(|| text.strip_suffix('\n'))
+        })
+        .filter(|text| {
+            (text.starts_with("http://") || text.starts_with("https://"))
+                && !text.chars().any(char::is_control)
+        })
+        .ok_or("OX returned an invalid page address.")?;
+    Ok(address.to_owned())
+}
+
 pub(crate) fn preview_port(project: &Path, label: &str) -> Result<PreviewPort, String> {
     let output = command(project, label)
         .arg("preview")
