@@ -2,6 +2,8 @@
 
 Run this on the host serving your development app. OX installs its browser component on request and uses an existing Chrome or Chromium executable when available. If the host needs Chrome for Testing, OX downloads it during installation. Linux ARM64 requires a system Chromium installation. You can choose an installed executable with `OX_BROWSER_EXECUTABLE=/absolute/path/to/chromium`.
 
+Run `ox browser install` again to refresh the component. It checks the official `vercel-labs/agent-browser` releases and verifies the checksum and size of the binary for your platform. The stable release and its binary must both be at least 24 hours old. Other browser commands use the installed component and never check for updates. Open sessions keep the component that started them. Close and reopen a session to use the refreshed version.
+
 ```sh
 ox browser install
 ox browser open http://localhost:3000
