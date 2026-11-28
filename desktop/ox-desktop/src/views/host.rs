@@ -1361,13 +1361,13 @@ impl Host {
         self.switch(i, window, cx);
     }
     fn pick_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_route = self.panes[self.active].read(cx).route.clone();
         if let Some(host) = self.link.remote().cloned() {
             let target = cx.weak_entity();
             let handle = window.window_handle();
-            let route = self.panes[self.active].read(cx).route.clone();
             self.message = super::remote_project::open(
                 host,
-                Some(route),
+                Some(current_route),
                 move |path, route, cx| {
                     let _ = handle.update(cx, |_, window, cx| {
                         target.update(cx, |s, cx| s.open(path, route, window, cx))
@@ -1389,8 +1389,8 @@ impl Host {
             let _ = s.update_in(cx, |s, window, cx| match result {
                 Ok(Ok(Some(paths))) if !paths.is_empty() => {
                     let path = paths[0].clone();
-                    s.with_project_dir(path, true, window, cx, |s, project, window, cx| {
-                        let route = s.recent.route(&project);
+                    s.with_project_dir(path, true, window, cx, move |s, project, window, cx| {
+                        let route = s.recent.saved_route(&project).unwrap_or(current_route);
                         s.open(project, route, window, cx);
                     });
                 }
