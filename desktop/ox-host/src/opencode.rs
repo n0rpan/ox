@@ -2,11 +2,13 @@
 //! subscription is live only; a caller must reconcile history and approvals
 //! after disconnect. The OX host owns the durable session registry.
 
+mod bootstrap;
 mod events;
 mod profile;
 #[path = "../../../src/sse.rs"]
 mod sse;
 
+pub use bootstrap::Hosted;
 pub use events::{Event, Events};
 pub use profile::{Owner, Profile};
 
