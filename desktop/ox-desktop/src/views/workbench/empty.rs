@@ -33,11 +33,14 @@ impl Workbench {
             self.route.runtime.name()
         );
         let frame = self.mascot_frame;
-        let offer_setup = self.store.as_ref().is_some_and(|store| {
-            store.state() == &ox_desk_core::store::Connection::Ready
-                && store.selected().is_none()
-                && store.draft(None).trim().is_empty()
-        });
+        let choose_project =
+            self.link.remote().is_none() && crate::platform::onboarding::is_home(&self.project);
+        let offer_setup = !choose_project
+            && self.store.as_ref().is_some_and(|store| {
+                store.state() == &ox_desk_core::store::Connection::Ready
+                    && store.selected().is_none()
+                    && store.draft(None).trim().is_empty()
+            });
         col()
             .flex_1()
             .min_h_0()
@@ -76,6 +79,16 @@ impl Workbench {
                     .child(connection),
             )
             .child(div().mt(px(24.)).w_full().child(dock))
+            .when(choose_project, |view| {
+                view.child(row().mt_2().child(button(
+                    p,
+                    "choose-project",
+                    "Choose project folder…",
+                    false,
+                    true,
+                    cx.listener(|_, _, _, cx| cx.emit(OpenProject)),
+                )))
+            })
             .when(offer_setup, |view| {
                 view.child(row().mt_2().child(button(
                     p, "project-setup-starter", "Get project setup help", false, true,
