@@ -8,7 +8,7 @@ use tokio::{
 };
 use tokio_tungstenite::tungstenite;
 const HEARTBEAT: Duration = Duration::from_secs(15);
-pub(super) const IDLE: Duration = Duration::from_secs(90);
+pub(crate) const IDLE: Duration = Duration::from_secs(90);
 
 pub(crate) trait Frame: Send + 'static {
     fn ping() -> Self;
