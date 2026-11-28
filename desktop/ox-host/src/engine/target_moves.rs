@@ -71,25 +71,6 @@ impl Engine {
         Ok(true)
     }
 
-    pub(super) fn stamp_moved_row(&self, scope: &Scope, row: &mut SessionView) {
-        let Some(display) = self
-            .target_moves
-            .displayed
-            .get(scope)
-            .and_then(|rows| rows.get(&row.id))
-        else {
-            return;
-        };
-        row.detail["logical_session_id"] = display.logical.clone();
-        row.detail["owned"] = serde_json::Value::Bool(true);
-        if row.detail["row"]["name"].is_null() {
-            row.title.clone_from(&display.title);
-            if let Some(runtime_row) = row.detail["row"].as_object_mut() {
-                runtime_row.insert("name".into(), serde_json::json!(display.title));
-            }
-        }
-    }
-
     fn remember_moved_row(&mut self, scope: &Scope, row: &SessionView) {
         self.target_moves
             .displayed
@@ -489,5 +470,21 @@ impl Engine {
         let target = VerifiedTarget::load(&self.state_dir, plan)?;
         let text = target.claude_request(&self.source_moves.ledger, scope, thread, text)?;
         Ok(Some((plan.id, thread.clone(), text)))
+    }
+}
+
+impl TargetMoves {
+    pub(super) fn stamp_row(&self, scope: &Scope, row: &mut SessionView) {
+        let Some(display) = self.displayed.get(scope).and_then(|rows| rows.get(&row.id)) else {
+            return;
+        };
+        row.detail["logical_session_id"] = display.logical.clone();
+        row.detail["owned"] = serde_json::Value::Bool(true);
+        if row.detail["row"]["name"].is_null() {
+            row.title.clone_from(&display.title);
+            if let Some(runtime_row) = row.detail["row"].as_object_mut() {
+                runtime_row.insert("name".into(), serde_json::json!(display.title));
+            }
+        }
     }
 }

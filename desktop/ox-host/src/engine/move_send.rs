@@ -1,12 +1,14 @@
 //! Source-side validation at the boundary of the connected destination host.
-use super::{Change, Engine, Message, Scope, Server};
+use super::{Change, Engine, Message, Scope, Server, target_moves::TargetMoves};
 use crate::{
     move_bundle::{Bundle, Presentation},
-    move_ledger::{Activated, ArchivePin, Cancelled, Commit, Plan, Prepared, Proposal, Status},
+    move_ledger::{
+        Activated, ArchivePin, Cancelled, Commit, Ledger, Plan, Prepared, Proposal, Status,
+    },
 };
 use ox_desk_core::{
     actions::{Action, MoveSession},
-    host_protocol::Timeline,
+    host_protocol::{SessionView, Timeline},
     store::Connection,
 };
 use ox_host_service::checkout::project_location;
@@ -55,67 +57,53 @@ pub(crate) enum Outcome {
     Cancelled(Cancelled, io::Result<()>),
 }
 
-impl Engine {
-    pub(super) fn annotate_move_changes(
-        &mut self,
+impl Outgoing {
+    pub(super) fn project_row(
+        &self,
+        ledger: &Ledger,
+        state: &Path,
+        targets: &TargetMoves,
         scope: &Scope,
-        changes: &mut [Change],
+        row: &mut SessionView,
     ) -> io::Result<()> {
         if !scope.route.runtime.supports_session_moves() {
             return Ok(());
         }
-        for change in changes {
-            let rows = match change {
-                Change::Session { session } => std::slice::from_mut(session),
-                Change::Sessions { sessions } => sessions.as_mut_slice(),
-                _ => continue,
-            };
-            for row in rows {
-                self.stamp_moved_row(scope, row);
-                if let Some(progress) = self.move_progress(scope, &row.id)? {
-                    attach_move_progress(row, progress);
-                } else if is_owned_lead(row)
-                    && row.detail["native_live"].is_null()
-                    && row.detail["terminal"] != true
-                    && (scope.route.runtime != ox_desk_core::runtime::Runtime::Claude
-                        || row
-                            .capabilities
-                            .iter()
-                            .any(|capability| capability == "end"))
-                    && row
-                        .capabilities
-                        .iter()
-                        .any(|capability| capability == "open")
-                {
-                    row.capabilities.push("move_session".into());
-                } else {
-                    continue;
-                }
-                if let Some(live) = self.running.get_mut(scope)
-                    && let Some(saved) = live
-                        .state
-                        .sessions
-                        .iter_mut()
-                        .find(|saved| saved.id == row.id)
-                {
-                    saved.clone_from(row);
-                }
-            }
+        targets.stamp_row(scope, row);
+        if let Some(progress) = self.progress(ledger, state, scope, &row.id)? {
+            attach_move_progress(row, progress);
+        } else if is_owned_lead(row)
+            && row.detail["native_live"].is_null()
+            && row.detail["terminal"] != true
+            && (scope.route.runtime != ox_desk_core::runtime::Runtime::Claude
+                || row
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "end"))
+            && row
+                .capabilities
+                .iter()
+                .any(|capability| capability == "open")
+        {
+            row.capabilities.push("move_session".into());
         }
         Ok(())
     }
 
-    fn move_progress(&self, scope: &Scope, native: &str) -> io::Result<Option<Value>> {
-        let Some((plan, status, stage)) = self.source_moves.ledger.source_move_at(scope, native)?
-        else {
+    fn progress(
+        &self,
+        ledger: &Ledger,
+        state: &Path,
+        scope: &Scope,
+        native: &str,
+    ) -> io::Result<Option<Value>> {
+        let Some((plan, status, stage)) = ledger.source_move_at(scope, native)? else {
             return Ok(None);
         };
-        let error = self.move_send.errors.get(&plan.id);
+        let error = self.errors.get(&plan.id);
         let phase = match status {
             Status::Queued if error.is_some() => "failed",
-            Status::Queued if self.source_moves.ledger.queued_result_seen(&plan)? => {
-                "waiting_for_workers"
-            }
+            Status::Queued if ledger.queued_result_seen(&plan)? => "waiting_for_workers",
             Status::Queued => "waiting",
             Status::Preparing if error.is_some() => "failed",
             Status::Preparing => "preparing",
@@ -125,7 +113,7 @@ impl Engine {
             Status::Cancelled => "cancelled",
             Status::Prepared | Status::Active => return Ok(None),
         };
-        let destination = linked_host(&self.state_dir, plan.target_host).ok();
+        let destination = linked_host(state, plan.target_host).ok();
         let name = destination
             .as_ref()
             .map_or("Connected host", |host| host.name.as_str());
@@ -138,9 +126,14 @@ impl Engine {
             "phase":phase, "message":error, "receipt":receipt}),
         ))
     }
+}
 
+impl Engine {
     fn publish_move_progress(&mut self, scope: &Scope, native: &str) -> io::Result<()> {
-        let Some(progress) = self.move_progress(scope, native)? else {
+        let Some(progress) =
+            self.move_send
+                .progress(&self.source_moves.ledger, &self.state_dir, scope, native)?
+        else {
             return Ok(());
         };
         let state = self

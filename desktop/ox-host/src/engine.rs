@@ -2204,7 +2204,17 @@ impl Engine {
             }
         }
         live.tracker.sync(&processes);
-        let mut changes = live.store.host_project(scope, &dirty, &mut live.state);
+        let mut changes = live
+            .store
+            .host_project_rows(&dirty, &mut live.state, |row| {
+                self.move_send.project_row(
+                    &self.source_moves.ledger,
+                    &self.state_dir,
+                    &self.target_moves,
+                    scope,
+                    row,
+                )
+            })?;
         crate::yolo::merge(
             &self.asking,
             self.mode_requests
@@ -2338,7 +2348,6 @@ impl Engine {
                     | Change::Transcript { .. }
             )
         });
-        self.annotate_move_changes(scope, &mut changes)?;
         if save_scope {
             self.ledger
                 .update(SavedScope::from_state(&self.running[scope].state))?;

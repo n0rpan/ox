@@ -319,6 +319,17 @@ impl Store {
         changed: &Changed,
         state: &mut ScopeState,
     ) -> Vec<Change> {
+        self.host_project_rows(changed, state, |_| Ok::<_, std::convert::Infallible>(()))
+            .unwrap()
+    }
+
+    /// Include host-owned row metadata in the comparison before emitting a delta.
+    pub fn host_project_rows<E>(
+        &self,
+        changed: &Changed,
+        state: &mut ScopeState,
+        mut decorate: impl FnMut(&mut SessionView) -> Result<(), E>,
+    ) -> Result<Vec<Change>, E> {
         let mut out = Vec::new();
         let scopes_changed = changed.surfaces() != 0;
         if scopes_changed {
@@ -385,9 +396,10 @@ impl Store {
                     if let Some(previous) = previous_results.get(&row.id) {
                         carry_result(&mut row, previous);
                     }
-                    row
+                    decorate(&mut row)?;
+                    Ok(row)
                 })
-                .collect();
+                .collect::<Result<_, E>>()?;
             if sessions != state.sessions {
                 out.extend(session_changes(&state.sessions, &sessions));
                 state.sessions = sessions;
@@ -413,6 +425,7 @@ impl Store {
             {
                 let mut next = self.session_view(row);
                 carry_result(&mut next, &prev.detail["last_result"]);
+                decorate(&mut next)?;
                 if next != *prev {
                     *prev = next.clone();
                     out.push(Change::Session { session: next });
@@ -517,7 +530,7 @@ impl Store {
                 });
             }
         }
-        out
+        Ok(out)
     }
     fn note(&self, thread: &str, event: NotificationKind, goal_reached: bool) -> Change {
         let title = self
@@ -586,6 +599,71 @@ mod session_change_tests {
             capabilities: vec![],
             detail: serde_json::Value::Null,
         }
+    }
+
+    #[test]
+    fn streaming_text_does_not_republish_a_decorated_session_row() {
+        use crate::{links::codex, runtime::Route, store::Profile, transcript::DeltaTarget};
+        let scope = Scope {
+            project: "/test".into(),
+            route: Route::CODEX_SUBSCRIPTION,
+        };
+        let link =
+            codex::Link::from_command(std::process::Command::new("/bin/cat"), |_| {}).unwrap();
+        let mut store = Store::open(
+            Profile {
+                project: scope.project.clone(),
+                route: scope.route.clone(),
+                provider: "openai".into(),
+            },
+            link,
+        )
+        .unwrap();
+        store.catalog.insert(
+            serde_json::from_value(json!({
+                "id":"lead","cwd":scope.project,"modelProvider":"openai","name":"Project lead",
+            }))
+            .unwrap(),
+        );
+        let transcript = store.transcripts.entry("lead".into()).or_default();
+        transcript.ready = true;
+        transcript.verified = true;
+        transcript.observe_delta(
+            "turn".into(),
+            "reply".into(),
+            DeltaTarget::Agent,
+            "First".into(),
+        );
+        let mut state = store.host_snapshot(&scope);
+        let decorate = |row: &mut SessionView| {
+            row.capabilities.push("move_session".into());
+            row.detail["logical_session_id"] = json!("existing-move");
+            Ok::<_, std::convert::Infallible>(())
+        };
+        let mut catalog = Changed::default();
+        catalog.mark(Changed::THREADS);
+        store
+            .host_project_rows(&catalog, &mut state, decorate)
+            .unwrap();
+        let transcript = store.transcripts.get_mut("lead").unwrap();
+        transcript.observe_delta(
+            "turn".into(),
+            "reply".into(),
+            DeltaTarget::Agent,
+            " more".into(),
+        );
+        let mut streaming = Changed::default();
+        streaming.transcript("lead");
+        let changes = store
+            .host_project_rows(&streaming, &mut state, decorate)
+            .unwrap();
+        assert!(matches!(changes.as_slice(), [Change::Append { text, .. }] if text == " more"));
+        assert!(
+            state.sessions[0]
+                .capabilities
+                .iter()
+                .any(|cap| cap == "move_session")
+        );
     }
 
     #[test]
