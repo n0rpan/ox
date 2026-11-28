@@ -27,6 +27,7 @@ import {
   catalogParentResolver,
   recentDays,
   sessionResult,
+  targetDigest,
 } from "./model.js";
 import {
   deviceKey,
@@ -159,6 +160,7 @@ let cold = new Map(),
   drafts = new Map(),
   timelineRows = new Map(),
   askKeys = "",
+  askCards = new Map(),
   pendingNew = null,
   handoffStamp = "",
   // Message and images sent from a composer whose Ack has not come back, by owner.
@@ -406,6 +408,7 @@ class Link {
           cold.clear();
           clearDrafts();
           timelineRows.clear();
+          askCards.clear();
           pickedProjects.clear();
           forgetComposer();
           routes = [];
@@ -572,15 +575,27 @@ class Link {
     if (this.closed) return;
     this.ready = false;
     this.inventoryRequest = null;
-    if (this === detailLink) { workerSubmission = null; $("worker-submit").disabled = false; }
+    const requestSubmissions = new Set();
+    if (this === detailLink) {
+      workerSubmission = null;
+      $("worker-submit").disabled = false;
+      // Hello can precede replay. A cached token needs a fresh snapshot before reuse.
+      if (this.model.scopes.get(scopeKey(this.scope))?.asks.length)
+        this.model.cursor = null;
+      for (const entry of askCards.values()) {
+        if (entry.phase === "sending" || entry.phase === "accepted") {
+          requestSubmissions.add(entry.submission);
+          entry.phase = "checking";
+        }
+      }
+    }
     if (!this.scope) {
       this.discoveryResult = null;
       notificationTarget.reconnect();
     }
     if (this.pending.size) {
-      notice(
-        "Disconnected before confirmation. Check the conversation before retrying.",
-      );
+      if ([...this.pending.keys()].some((id) => !requestSubmissions.has(id)))
+        notice("Disconnected before confirmation. Check the conversation before retrying.");
       for (const cb of this.pending.values()) cb?.(false);
       this.pending.clear();
     }
@@ -845,16 +860,18 @@ function home() {
   detailLink?.close();
   detailLink = null;
   selected = null;
+  askCards.clear();
+  $("asks").replaceChildren();
   pendingNew = null;
   page("catalog");
   notice();
   repaint();
 }
-function open(scope, id) {
+function open(scope, id, request = null) {
   closeWorkerForm();
   controls.reset();
   detailLink?.close();
-  selected = { scope, id, revealLatest: Boolean(id), openingResult: Boolean(id) };
+  selected = { scope, id, request, revealLatest: Boolean(id), openingResult: Boolean(id) };
   $("worker-results").open = false;
   pendingVisibleResult = null;
   setComposerOwner(keyOf(scope, id), repaint, notice);
@@ -862,6 +879,7 @@ function open(scope, id) {
   visibleRows = 200;
   timelineRows.clear();
   askKeys = "";
+  askCards.clear();
   handoffStamp = "";
   jumpLatest.reset();
   $("asks").replaceChildren();
@@ -916,7 +934,12 @@ function catalog() {
         notice("This notification’s session is no longer in the list.");
       else if (match === "incomplete")
         notice("OX couldn’t load the full session list for this notification. Reconnect and look for the session.");
-      else open(match.scope, match.session?.id ?? null);
+      else {
+        const request = match.request != null || match.requestDigest
+          ? { id: match.request, digest: match.requestDigest }
+          : null;
+        open(match.scope, match.session?.id ?? null, request);
+      }
     });
   }
   const needle = $("find-sessions").value.trim().toLocaleLowerCase();
@@ -989,10 +1012,10 @@ function catalog() {
   );
   const frag = document.createDocumentFragment();
   if (filter === "all" || filter === "requests") {
-    for (const {scope} of drafts) {
+    for (const { scope, request } of drafts) {
       const title = `New session approval · ${leaf(scope.project)} · ${routesLabel(scope.route)}`;
       if (needle && !title.toLocaleLowerCase().includes(needle)) continue;
-      const entry = button(title, () => open(scope, null));
+      const entry = button(title, () => open(scope, null, { id: request }));
       entry.className = "session";
       entry.dataset.needsInput = "true";
       frag.append(entry);
@@ -1314,97 +1337,156 @@ function renderFolders(frag, tree, filtering, projectLabel, renderEntry) {
     }
   });
 }
-function showAsks(asks) {
-  const stamp = JSON.stringify(asks);
-  if (stamp === askKeys) return;
-  askKeys = stamp;
-  const root = $("asks");
-  root.replaceChildren();
-  for (const a of asks) {
-    const card = el("article", "ask");
-    // A child that would run in YOLO waits here for the operator (ox-host yolo.rs).
-    if (String(a.id).startsWith("ox-yolo-")) {
-      card.classList.add("yolo");
-      card.append(el("p", "ask-kicker", "YOLO approval"));
-    }
-    card.append(el("h2", "", a.title));
-    if (a.detail) card.append(el("p", "", a.detail));
-    // The command a shell approval would run, as the desktop card shows it.
-    if (a.command?.command) {
-      card.append(el("pre", "ask-command", a.command.command));
-      if (a.command.cwd) card.append(el("p", "ask-kicker", String(a.command.cwd)));
-    }
-    const answer = (action) => {
-      for (const b of card.querySelectorAll("button")) b.disabled = true;
-      if (
-        !detailLink.act(action, a.token, (ok) => {
-          if (!ok)
-            for (const b of card.querySelectorAll("button")) b.disabled = false;
-        })
-      )
-        for (const b of card.querySelectorAll("button")) b.disabled = false;
-    };
-    if (a.questions?.length) {
-      const fields = [];
-      for (const q of a.questions) {
-        const f = el("fieldset");
-        f.append(el("legend", "", q.question));
-        const choices = [];
-        let other = null;
-        for (const option of q.options || []) {
-          const l = el("label", "option"),
-            input = el("input");
-          input.name = q.id;
-          input.type = q.multiSelect ? "checkbox" : "radio";
-          input.value = option.label;
-          l.append(
-            input,
-            el(
-              "span",
-              "",
-              option.label +
-                (option.description ? " — " + option.description : ""),
-            ),
-          );
-          f.append(l);
-          choices.push(input);
-        }
-        if (q.isOther || !choices.length) {
-          other = el("input");
-          other.type = q.isSecret ? "password" : "text";
-          other.setAttribute("aria-label", q.question);
-          f.append(other);
-        }
-        fields.push(() =>
-          [
-            ...choices.filter((c) => c.checked).map((c) => c.value),
-            other?.value.trim(),
-          ]
-            .filter(Boolean)
-            .join(", "),
-        );
-        card.append(f);
-      }
-      card.append(
-        button("Submit answers", () => {
-          const values = fields.map((fn) => fn());
-          if (values.every(Boolean))
-            answer({ answer_questions: [a.id, values] });
-          else notice("Answer each question first.");
-        }),
-      );
-    } else {
-      a.choices.forEach((c, i) => {
-        const choice = button(c, () => answer({ answer_ask: [a.id, i] }));
-        // Permission decisions are deliberately equal-weight choices.
-        choice.className = /^(deny|decline|reject|cancel|no\b)/i.test(c)
-          ? "decision deny"
-          : "decision";
-        card.append(choice);
-      });
-    }
-    root.append(card);
+function askCard(a) {
+  const card = el("article", "ask");
+  card.tabIndex = -1;
+  const status = el("p", "ask-kicker");
+  status.setAttribute("role", "status");
+  const entry = { card, status, phase: "pending" };
+  // A child that would run in YOLO waits here for the operator (ox-host yolo.rs).
+  if (String(a.id).startsWith("ox-yolo-")) {
+    card.classList.add("yolo");
+    card.append(el("p", "ask-kicker", "YOLO approval"));
   }
+  card.append(el("h2", "", a.title));
+  if (a.detail) card.append(el("p", "", a.detail));
+  // The command a shell approval would run, as the desktop card shows it.
+  if (a.command?.command) {
+    card.append(el("pre", "ask-command", a.command.command));
+    if (a.command.cwd) card.append(el("p", "ask-kicker", String(a.command.cwd)));
+  }
+  const answer = (action) => {
+    if (entry.phase !== "pending" && entry.phase !== "retry") return;
+    const sent = detailLink.act(action, a.token, (ok, message) => {
+      if (ok) entry.phase = "accepted";
+      else if (message) entry.phase = "retry";
+      repaint();
+    });
+    if (sent) {
+      entry.phase = "sending";
+      entry.submission = sent;
+      for (const button of entry.buttons) button.disabled = true;
+      repaint();
+    }
+  };
+  if (a.questions?.length) {
+    const fields = [];
+    const group = crypto.randomUUID();
+    for (const [index, q] of a.questions.entries()) {
+      const f = el("fieldset");
+      f.append(el("legend", "", q.question));
+      const choices = [];
+      let other = null;
+      for (const option of q.options || []) {
+        const l = el("label", "option"),
+          input = el("input");
+        input.name = `${group}-${index}`;
+        input.type = q.multiSelect ? "checkbox" : "radio";
+        input.value = option.label;
+        l.append(
+          input,
+          el(
+            "span",
+            "",
+            option.label +
+              (option.description ? " — " + option.description : ""),
+          ),
+        );
+        f.append(l);
+        choices.push(input);
+      }
+      if (q.isOther || !choices.length) {
+        other = el("input");
+        other.type = q.isSecret ? "password" : "text";
+        other.setAttribute("aria-label", q.question);
+        f.append(other);
+      }
+      fields.push(() =>
+        [
+          ...choices.filter((c) => c.checked).map((c) => c.value),
+          other?.value.trim(),
+        ]
+          .filter(Boolean)
+          .join(", "),
+      );
+      card.append(f);
+    }
+    card.append(
+      button("Submit answers", () => {
+        const values = fields.map((fn) => fn());
+        if (values.every(Boolean))
+          answer({ answer_questions: [a.id, values] });
+        else notice("Answer each question first.");
+      }),
+    );
+  } else {
+    a.choices.forEach((c, i) => {
+      const choice = button(c, () => answer({ answer_ask: [a.id, i] }));
+      // Permission decisions are deliberately equal-weight choices.
+      choice.className = /^(deny|decline|reject|cancel|no\b)/i.test(c)
+        ? "decision deny"
+        : "decision";
+      card.append(choice);
+    });
+  }
+  card.append(status);
+  entry.buttons = [...card.querySelectorAll("button")];
+  return entry;
+}
+function showAsks(asks) {
+  const ready = detailLink?.ready && detailLink.model.scopes.has(scopeKey(selected.scope));
+  const visible = new Map();
+  askKeys = JSON.stringify(asks.map((a) => a.token));
+  for (const a of asks) {
+    const entry = askCards.get(a.token) ?? askCard(a);
+    if (ready && entry.phase === "checking") entry.phase = "retry";
+    const phase = entry.phase;
+    const actionable = phase === "pending" || phase === "retry";
+    for (const button of entry.buttons) button.disabled = !ready || !actionable;
+    const message = !ready
+      ? "Checking this request when OX reconnects…"
+      : {
+          pending: "",
+          sending: "Submitting…",
+          accepted: "Submitted. Waiting for the session to update…",
+          retry: "This request is still pending. Review and submit again.",
+        }[phase];
+    if (entry.status.textContent !== message) entry.status.textContent = message;
+    entry.status.hidden = !message;
+    visible.set(a.token, entry);
+  }
+  for (const [token, entry] of askCards) {
+    if (visible.has(token)) continue;
+    entry.card.remove();
+    if (ready && ["sending", "accepted", "checking"].includes(entry.phase))
+      notice(entry.phase === "accepted" ? "Request submitted." : "The request is no longer pending.");
+  }
+  askCards = visible;
+  syncChildren($("asks"), [...visible.values()].map(({ card }) => card));
+  if (ready && selected.request && !selected.targeting) {
+    selected.revealLatest = false;
+    void revealRequest(asks, selected);
+  }
+}
+async function revealRequest(asks, selection) {
+  selection.targeting = true;
+  const { id, digest } = selection.request;
+  const candidates = asks.filter((a) => id == null || a.id === id);
+  let match = candidates[0];
+  if (digest) {
+    const digests = await Promise.all(candidates.map((a) => targetDigest(a.token))).catch(() => []);
+    match = candidates[digests.indexOf(digest)];
+  }
+  selection.targeting = false;
+  if (selection !== selected || !detailLink?.ready) return;
+  selection.request = null;
+  const entry = match && askCards.get(match.token);
+  if (entry) focusAsk(entry.card);
+  else notice("The request is no longer pending.");
+}
+function focusAsk(card) {
+  card.focus({ preventScroll: true });
+  card.scrollIntoView({ block: "center" });
 }
 function syncChildren(root, nodes) {
   let next = root.firstChild;
@@ -2053,29 +2135,36 @@ function render() {
   if (!$("conversation").hidden) conversation();
   updateNeedsBar();
 }
-// A sticky "needs you" bar in the composer stack whenever any session has a pending ask.
+// The live catalog reports pending destinations without revealing request contents.
 function updateNeedsBar() {
   const bar = $("needs-bar");
-  const seen = new Set(),
-    asks = [];
+  const destinations = new Map();
   for (const model of [global, detailLink?.model]) {
     for (const s of model?.scopes.values() ?? []) {
-      for (const a of s.asks ?? []) {
-        const id = scopeKey(s.scope) + " " + a.id;
-        if (seen.has(id)) continue;
-        seen.add(id);
-        asks.push({ scope: s.scope, thread: a.thread });
-      }
+      for (const thread of s.detail?.request_threads ?? [])
+        destinations.set(keyOf(s.scope, thread), { scope: s.scope, thread });
+      if (s.detail?.draft_requests?.length)
+        destinations.set(keyOf(s.scope, null), { scope: s.scope, thread: null });
+      for (const a of s.asks ?? [])
+        destinations.set(keyOf(s.scope, a.thread), { scope: s.scope, thread: a.thread });
     }
   }
-  bar.hidden = !asks.length;
-  if (!asks.length) return;
-  const n = asks.length;
-  bar.textContent = `NEEDS YOU · ${n === 1 ? "1 request" : `${n} requests`}`;
+  bar.hidden = !destinations.size;
+  if (!destinations.size) return;
+  const n = destinations.size;
+  bar.textContent = n === 1 ? "NEEDS YOU · View requests" : `NEEDS YOU · ${n} conversations`;
   bar.onclick = () => {
     const here = $("asks").firstElementChild;
-    if (here) here.scrollIntoView({ behavior: "smooth", block: "center" });
-    else open(asks[0].scope, asks[0].thread);
+    if (n === 1 && here) focusAsk(here);
+    else if (n === 1) {
+      const { scope, thread } = destinations.values().next().value;
+      open(scope, thread);
+    } else {
+      home();
+      $("find-sessions").value = "";
+      $("filters").querySelector('[data-filter="requests"]').click();
+      repaint();
+    }
   };
 }
 $("menu-stop").onclick = () => $("stop").click();

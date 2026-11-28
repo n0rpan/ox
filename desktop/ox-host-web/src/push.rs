@@ -555,12 +555,15 @@ enum Notices {
 #[derive(Default)]
 struct ActiveAsks(HashMap<Scope, HashMap<[u8; 32], watch::Sender<()>>>);
 
+struct NewAsk {
+    thread: String,
+    kind: NotificationKind,
+    digest: [u8; 32],
+    done: watch::Receiver<()>,
+}
+
 impl ActiveAsks {
-    fn replace(
-        &mut self,
-        scope: &Scope,
-        asks: Vec<NoticeAsk>,
-    ) -> Vec<(String, NotificationKind, watch::Receiver<()>)> {
+    fn replace(&mut self, scope: &Scope, asks: Vec<NoticeAsk>) -> Vec<NewAsk> {
         let mut previous = self.0.remove(scope).unwrap_or_default();
         let mut current = HashMap::new();
         let mut added = Vec::new();
@@ -582,7 +585,12 @@ impl ActiveAsks {
                 } else {
                     NotificationKind::Question
                 };
-                added.push((thread, kind, rx));
+                added.push(NewAsk {
+                    thread,
+                    kind,
+                    digest: token,
+                    done: rx,
+                });
                 tx
             });
             current.insert(token, sender);
@@ -633,8 +641,8 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
     notifications.extend(
         new_asks
             .iter()
-            .filter(|(id, _, _)| id.starts_with("ask:ox-yolo-"))
-            .map(|(id, kind, _)| (id.clone(), "New OX session".into(), *kind, false)),
+            .filter(|ask| ask.thread.starts_with("ask:ox-yolo-"))
+            .map(|ask| (ask.thread.clone(), "New OX session".into(), ask.kind, false)),
     );
     let mut payloads = Vec::new();
     for (thread, title, kind, goal_reached) in notifications {
@@ -644,11 +652,11 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
         ) {
             let Some(index) = new_asks
                 .iter()
-                .position(|(id, event, _)| id == &thread && *event == kind)
+                .position(|ask| ask.thread == thread && ask.kind == kind)
             else {
                 continue;
             };
-            Some(new_asks.remove(index).2)
+            Some(new_asks.remove(index))
         } else {
             None
         };
@@ -658,7 +666,11 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
             .filter(|c| !c.is_control())
             .take(80)
             .collect::<String>();
-        let thread = crate::phone_link::session_target(&scope, &thread)?;
+        let mut thread = crate::phone_link::session_target(&scope, &thread)?;
+        if let Some(ask) = &ask {
+            thread.push_str("~ask=");
+            thread.push_str(&B64.encode(ask.digest));
+        }
         let event = Event::Session(kind);
         let payload = |kind| {
             serde_json::to_vec(&Payload {
@@ -668,7 +680,7 @@ fn notices(bytes: &[u8], cursor: Option<&Cursor>, asks: &mut ActiveAsks) -> io::
             })
         };
         payloads.push(Notice {
-            ask,
+            ask: ask.map(|ask| ask.done),
             expires: Instant::now() + ttl,
             event,
             bytes: payload(event)?,
@@ -950,7 +962,16 @@ mod tests {
             assert_eq!(v["kind"], serde_json::to_value(kind).unwrap());
             assert_eq!(v["title"], "Fix login");
             let thread = v["thread"].as_str().unwrap();
-            assert!(thread.starts_with("thread-1~") && thread.len() == "thread-1~".len() + 43);
+            let target = crate::phone_link::session_target(&scope, "thread-1").unwrap();
+            if matches!(
+                kind,
+                NotificationKind::Approval | NotificationKind::Question
+            ) {
+                let digest = ring::digest::digest(&ring::digest::SHA256, leak("token").as_bytes());
+                assert_eq!(thread, format!("{target}~ask={}", B64.encode(digest)));
+            } else {
+                assert_eq!(thread, target);
+            }
         }
     }
     #[test]
