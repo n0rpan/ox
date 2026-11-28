@@ -3094,6 +3094,7 @@ impl Host {
                     Runtime::Codex => activity::Cartridge::Codex,
                     Runtime::Claude => activity::Cartridge::Claude,
                     Runtime::Antigravity => activity::Cartridge::Antigravity,
+                    Runtime::OpenCode => activity::Cartridge::Api,
                 }
             };
             let project_name = project

@@ -4,6 +4,7 @@ use ox_desk_core::{
     asks::CommandApproval,
     host_protocol::{AskView, SessionResult, SessionView, Timeline, TimelineItem},
     runtime::RequestId,
+    transcript::item::{Content, Item},
 };
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -61,6 +62,31 @@ pub(super) fn snapshot(
         .turn
         .as_ref()
         .filter(|turn| turn.phase.outcome().is_none());
+    let mut transcript = timeline(&page);
+    transcript.detail["active"] = json!(active.map(|turn| &turn.native_message));
+    transcript.detail["interrupted"] =
+        json!(receipt.is_some_and(|receipt| receipt.phase == Phase::Stopped));
+    transcript.detail["last_finished"] = json!(record.turn.as_ref().and_then(|turn| {
+        matches!(turn.phase, Phase::Completed | Phase::Failed).then_some(&turn.native_message)
+    }));
+    if receipt.is_some_and(|receipt| receipt.phase == Phase::Failed) {
+        transcript.detail["error"] = json!("OpenCode reported a turn failure.");
+    }
+    Snapshot {
+        session: session_view(id, &record, idle, !asks.is_empty()),
+        transcript,
+        asks,
+        before: page.before,
+        receipt,
+    }
+}
+
+pub(super) fn session_view(
+    id: Uuid,
+    record: &Record,
+    idle: bool,
+    needs_input: bool,
+) -> SessionView {
     let result = record.turn.as_ref().and_then(|turn| {
         Some(SessionResult {
             turn: turn.native_message.clone(),
@@ -68,33 +94,27 @@ pub(super) fn snapshot(
             outcome: turn.phase.outcome()?,
         })
     });
-    let status = if !asks.is_empty() {
+    let status = if needs_input {
         "needs_input"
-    } else if !idle || active.is_some() {
+    } else if !idle || record.turn.is_some() && result.is_none() {
         "running"
-    } else if receipt.is_some_and(|receipt| receipt.phase == Phase::Failed) {
+    } else if record
+        .turn
+        .as_ref()
+        .is_some_and(|turn| turn.phase == Phase::Failed)
+    {
         "failed"
     } else {
         "idle"
     };
-    let mut transcript = timeline(&page);
-    transcript.detail["active"] = json!(active.map(|turn| &turn.native_message));
-    transcript.detail["interrupted"] =
-        json!(receipt.is_some_and(|receipt| receipt.phase == Phase::Stopped));
-    Snapshot {
-        session: SessionView {
-            id: id.to_string(),
-            title: record.title,
-            parent: None,
-            status: status.into(),
-            updated_at: record.updated_at,
-            capabilities: Vec::new(),
-            detail: json!({"owned": true, "last_result": result}),
-        },
-        transcript,
-        asks,
-        before: page.before,
-        receipt,
+    SessionView {
+        id: id.to_string(),
+        title: record.title.clone(),
+        parent: None,
+        status: status.into(),
+        updated_at: record.updated_at,
+        capabilities: Vec::new(),
+        detail: json!({"owned": true, "last_result": result}),
     }
 }
 
@@ -110,18 +130,33 @@ pub(super) fn timeline(page: &HistoryPage) -> Timeline {
                 let turn = turn?;
                 let id = part["id"].as_str()?;
                 let (role, text, detail) = match (part["type"].as_str()?, role) {
-                    ("text", Some(role @ ("user" | "assistant"))) if part["synthetic"] != true => {
-                        (role, part["text"].as_str()?.to_owned(), Value::Null)
+                    ("text", Some("user")) if part["synthetic"] != true => {
+                        let text = part["text"].as_str()?.to_owned();
+                        let item = Item::UserMessage {
+                            content: vec![Content {
+                                text: Some(text.clone()),
+                                path: None,
+                            }],
+                        };
+                        ("user", text, json!(item))
+                    }
+                    ("text", Some("assistant")) if part["synthetic"] != true => {
+                        ("assistant", part["text"].as_str()?.to_owned(), Value::Null)
                     }
                     ("tool", Some("assistant")) => {
                         let tool = part["tool"].as_str()?;
                         let state = &part["state"];
+                        let status = state["status"].as_str().unwrap_or("pending").to_owned();
                         let output = state["output"].as_str().or_else(|| state["error"].as_str());
+                        let item = Item::ToolCall {
+                            status: status.clone(),
+                            tool: tool.to_owned(),
+                        };
                         (
                             "tool",
                             output
                                 .map_or_else(|| tool.into(), |output| format!("{tool}\n{output}")),
-                            json!({"status":state["status"], "output":output}),
+                            json!({"item":item, "status":status, "output":output}),
                         )
                     }
                     _ => return None,

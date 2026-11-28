@@ -122,6 +122,29 @@ impl RouteRuntime {
         Ok(self.ledger.ids())
     }
 
+    pub fn catalog(&self, owner: &Owner) -> Result<Vec<(Uuid, SessionView, Option<Receipt>)>> {
+        self.check_owner(owner)?;
+        Ok(self
+            .ledger
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                let record = self.ledger.get(id)?;
+                let receipt = record.turn.as_ref().map(Turn::receipt);
+                Some((
+                    id,
+                    projection::session_view(id, record, true, false),
+                    receipt,
+                ))
+            })
+            .collect())
+    }
+
+    pub fn receipt(&self, owner: &Owner, id: Uuid) -> Result<Option<Receipt>> {
+        self.check_owner(owner)?;
+        Ok(self.record(id)?.turn.as_ref().map(Turn::receipt))
+    }
+
     /// The OX host allocates this identifier before issuing a create action.
     pub fn create(&mut self, owner: &Owner, id: Uuid, title: &str) -> Result<()> {
         self.check_owner(owner)?;

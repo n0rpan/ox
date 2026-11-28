@@ -32,6 +32,9 @@ pub(super) struct ModeRequest {
 
 impl Engine {
     pub(super) fn waiting_open_client(&mut self, scope: &Scope, key: &str) -> Option<&mut u64> {
+        if scope.route.runtime == ox_desk_core::runtime::Runtime::OpenCode {
+            return self.running.get_mut(scope)?.store.opencode_waiter(key);
+        }
         if scope.route.runtime == ox_desk_core::runtime::Runtime::Antigravity
             && let Some((client, pending)) = self
                 .running

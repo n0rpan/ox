@@ -16,7 +16,7 @@ use ox_desk_core::{
     links::LinkEvent,
     modes::{Level, YoloAllowance},
     origin::{Origin, ParentCall, WorkerMode, WorkerStart},
-    runtime::RequestId,
+    runtime::{RequestId, Runtime},
     store::{Connection, Store},
     surface::Sender,
 };
@@ -224,6 +224,8 @@ impl ClientState {
     fn supports_scope(&self, scope: &Scope) -> bool {
         self.version
             .is_some_and(|version| wire::supports_route(version, &scope.route))
+            && (scope.route.runtime != Runtime::OpenCode
+                || self.subscription.as_ref().and_then(Option::as_ref) == Some(scope))
     }
 }
 struct Live {
@@ -372,6 +374,7 @@ mod placement;
 use placement::HostQuery;
 mod mode_requests;
 mod notices;
+mod opencode;
 
 impl Drop for Engine {
     fn drop(&mut self) {
@@ -729,7 +732,9 @@ impl Engine {
         };
         if let Some(version) = client.version {
             if !message.supported_by(version) {
-                return Err(io::Error::other("Antigravity requires OX host protocol 2"));
+                return Err(io::Error::other(
+                    "The requested runtime is unavailable on this OX host protocol version",
+                ));
             }
         } else if !matches!(message, Client::Hello { .. }) {
             return Err(io::Error::other("Send a protocol hello first"));
@@ -844,6 +849,7 @@ impl Engine {
             } => {
                 let scope = canonical_scope(scope)?;
                 let result=self.running.get(&scope)
+                    .filter(|_| scope.route.runtime != Runtime::OpenCode)
                     .filter(|_|client.subscription.as_ref()==Some(&Some(scope.clone())) && !key.is_empty() && key.len()<=256)
                     .filter(|l|l.store.can_send(Some(&thread)) && !l.store.in_terminal(&thread)
                         && l.store.transcript(&thread).is_some_and(|t|t.active_turn().is_none())
@@ -917,6 +923,7 @@ impl Engine {
                     .values()
                     .map(|live| &live.state)
                     .chain(self.cold.values())
+                    .filter(|state| state.scope.route.runtime != Runtime::OpenCode)
                     .map(catalog_snapshot)
                     .collect();
                 self.reply(
@@ -1041,8 +1048,9 @@ impl Engine {
                     Err(e) => return self.reply(id, fail(e.to_string())),
                 };
                 let subscribed = self.clients[&id].subscription.as_ref();
-                if !matches!(subscribed, Some(None))
-                    && !matches!(subscribed,Some(Some(s)) if s==&scope)
+                if !matches!(subscribed,Some(Some(s)) if s==&scope)
+                    && (scope.route.runtime == Runtime::OpenCode
+                        || !matches!(subscribed, Some(None)))
                 {
                     return self.reply(
                         id,
@@ -1053,7 +1061,8 @@ impl Engine {
                 // there is running, so reopening one only to tell it so would start a runtime
                 // the user just asked to be rid of. The workers and requests under it are
                 // still ended or withdrawn.
-                if !self.running.contains_key(&scope)
+                if scope.route.runtime != Runtime::OpenCode
+                    && !self.running.contains_key(&scope)
                     && self.cold.contains_key(&scope)
                     && let Action::EndSession(thread) | Action::ForceEndSession(thread) = &action
                 {
@@ -1296,7 +1305,10 @@ impl Engine {
             .iter()
             .map(|(s, l)| (s, &l.state))
             .chain(self.cold.iter())
-            .filter(|(s, _)| scope.as_ref().is_none_or(|wanted| wanted == *s))
+            .filter(|(s, _)| match scope.as_ref() {
+                Some(wanted) => wanted == *s,
+                None => s.route.runtime != Runtime::OpenCode,
+            })
             .map(|(_, s)| s.clone())
             .collect();
         self.reply(
@@ -1358,16 +1370,30 @@ impl Engine {
             }
         });
         let into = inbox.clone();
-        let mut store = self
-            .config
-            .open(scope, prepared, move |event| into.push(event))?;
+        let opencode = scope.route.runtime == Runtime::OpenCode;
+        let mut store = if opencode {
+            opencode::open(
+                scope,
+                self.host_id.to_string(),
+                &self.state_dir,
+                self.config.ox.clone(),
+                move |event| into.push(event),
+            )?
+        } else {
+            self.config
+                .open(scope, prepared, move |event| into.push(event))?
+        };
         // Opening the route also subscribes it for stop, approval and recovery.
         // Actual launches read the policy again and report an unreadable file.
-        store.use_host_policy(HostPolicy::read(&self.state_dir).unwrap_or(HostPolicy::AlwaysRead));
-        store.enable_memory(
-            ox_desk_core::memory::store_path_for(&self.state_dir),
-            self.host_id.to_string(),
-        );
+        if !opencode {
+            store.use_host_policy(
+                HostPolicy::read(&self.state_dir).unwrap_or(HostPolicy::AlwaysRead),
+            );
+            store.enable_memory(
+                ox_desk_core::memory::store_path_for(&self.state_dir),
+                self.host_id.to_string(),
+            );
+        }
         let previous = self.running.get_mut(scope);
         let prior = previous
             .as_ref()
@@ -1390,6 +1416,7 @@ impl Engine {
             .cold
             .remove(scope)
             .or(prior)
+            .filter(|_| !opencode)
             .map(|old| old.sessions)
             .unwrap_or_default();
         // Threads the host had no process for stay resumable by a send.
@@ -1481,6 +1508,9 @@ impl Engine {
             return Err(io::Error::other(
                 "Approval was already resolved or belongs to an earlier runtime",
             ));
+        }
+        if scope.route.runtime == Runtime::OpenCode {
+            return live.store.dispatch_opencode(id, key, action);
         }
         if let Action::AnswerAsk(ask, choice) = &action
             && let Some(job) = crate::yolo::job_of(ask)
@@ -2139,6 +2169,34 @@ impl Engine {
             });
         }
         let mut created = Vec::new();
+        if scope.route.runtime == Runtime::OpenCode {
+            for (client, key, result) in live.store.take_opencode_completions() {
+                match result {
+                    Ok(thread) => {
+                        if let Some(thread) = thread {
+                            self.receipts.opened(scope, &key, &thread);
+                            created.push((
+                                client,
+                                Server::Opened {
+                                    id: key.clone(),
+                                    scope: scope.clone(),
+                                    thread,
+                                },
+                            ));
+                        }
+                        created.push((client, Server::Ack { id: key }));
+                    }
+                    Err(message) => {
+                        let frame = Server::Error {
+                            id: Some(key.clone()),
+                            message,
+                        };
+                        self.receipts.finish(scope, &key, frame.clone());
+                        created.push((client, frame));
+                    }
+                }
+            }
+        }
         let antigravity = scope.route.runtime == ox_desk_core::runtime::Runtime::Antigravity;
         if let Some(thread) = opened
             && let Some((id, key)) = live.opening.take()
@@ -3068,6 +3126,7 @@ impl Engine {
                         ox_desk_core::runtime::Runtime::Codex => "codex",
                         ox_desk_core::runtime::Runtime::Claude => "claude",
                         ox_desk_core::runtime::Runtime::Antigravity => "antigravity",
+                        ox_desk_core::runtime::Runtime::OpenCode => "opencode",
                     }
                 }
                 .into(),
@@ -3254,7 +3313,9 @@ impl Engine {
         let Some(live) = self.running.get(scope) else {
             return Ok(());
         };
-        let idle = live.store.live_threads().is_empty()
+        let idle = (scope.route.runtime != Runtime::OpenCode
+            || !live.store.opencode_has_pending_requests())
+            && live.store.live_threads().is_empty()
             && live.store.active_turns() == 0
             && live.store.asks().is_empty()
             && !live.store.opening_thread()
