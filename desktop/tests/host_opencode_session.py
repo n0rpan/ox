@@ -73,12 +73,6 @@ def assistant(timeline, text):
                for item in timeline.get("items", []))
 
 
-def current_assistant(timeline):
-    turn = timeline.get("detail", {}).get("active")
-    return turn is not None and any(
-        item["role"] == "assistant" and item["turn"] == turn for item in timeline.get("items", []))
-
-
 def receipt(rows, thread):
     return next((row["detail"]["last_result"] for row in rows
                  if row["id"] == thread and row["detail"].get("last_result")), {})
@@ -159,7 +153,9 @@ def exercise(root, host, ox, stock, provider):
             thread = opened["thread"]
             assert str(uuid.UUID(thread)) == thread, opened
             await_result(client, "new")
-            state = state_with(client, route, thread, lambda timeline, _: current_assistant(timeline))
+            state = state_with(client, route, thread, lambda timeline, _: assistant(timeline, "first"))
+            assert not provider.gates["reconnect"].is_set()
+            assert state["transcripts"][thread]["detail"]["active"] is not None
             assert state["capabilities"] == ["start"], state["capabilities"]
             row = next(row for row in state["sessions"] if row["id"] == thread)
             assert set(row["capabilities"]) == {"open", "stop"}, row
@@ -170,14 +166,14 @@ def exercise(root, host, ox, stock, provider):
 
             with closing(Client(env["OX_HOST_SOCKET"], 3)) as second:
                 state = snapshot(second, route)
-                assert current_assistant(state["transcripts"][thread]), state
+                assert assistant(state["transcripts"][thread], "first"), state
                 second.act(route, "new", {"send_text": [None, "reconnect"]})
                 assert response(second, "new", {"opened"})["thread"] == thread
                 await_result(second, "new")
                 request_failure(second, route, "new", {"send_text": [None, "wrong"]}, "different")
                 provider.gates["reconnect"].set()
                 second.until(lambda frame: any(
-                    change["kind"] == "append" and change["thread"] == thread and change["text"] == "first restored"
+                    change["kind"] == "append" and change["thread"] == thread and change["text"] == " restored"
                     for change in frame.get("changes", [])))
                 state_with(second, route, thread, lambda tl, rows:
                            assistant(tl, "first restored") and outcome(rows, thread) == "completed")
@@ -206,7 +202,7 @@ def exercise(root, host, ox, stock, provider):
 
             client.act(route, "cancel-turn", {"send_text": [thread, "cancel stream"]})
             await_result(client, "cancel-turn")
-            state_with(client, route, thread, lambda tl, _: current_assistant(tl))
+            state_with(client, route, thread, lambda tl, _: assistant(tl, "partial"))
             client.act(route, "stop", {"stop": thread})
             await_result(client, "stop")
             provider.gates["cancel stream"].set()
@@ -240,7 +236,7 @@ def exercise(root, host, ox, stock, provider):
             await_result(client, "older")
             archive = snapshot(client, route)["transcripts"][thread]
             assert not archive["detail"]["older"] and assistant(archive, "first restored"), archive
-    print("OpenCode socket enrollment, exact API billing, transcript deltas, receipts, approval, Stop, restart and history paging passed")
+    print("OpenCode socket enrollment, exact API billing, text before native text-end, transcript deltas, receipts, approval, Stop, restart and history paging passed")
     if Path("/proc").is_dir():
         print("Verified off route starts no worker and idle worker blocks without scheduled refreshes")
 

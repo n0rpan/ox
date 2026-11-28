@@ -343,6 +343,15 @@ impl Adapter {
 
     pub fn events(&self, owner: &Owner, session: &Session) -> Result<Events> {
         let id = self.check_session(owner, session)?;
+        self.open_events(Some(id.to_owned()))
+    }
+
+    pub fn route_events(&self, owner: &Owner) -> Result<Events> {
+        self.check_owner(owner)?;
+        self.open_events(None)
+    }
+
+    fn open_events(&self, session: Option<String>) -> Result<Events> {
         let response = self.request(
             Method::GET,
             &["event"],
@@ -351,7 +360,7 @@ impl Adapter {
             StatusCode::OK,
             EVENT_TIMEOUT,
         )?;
-        Events::new(response, id.to_owned())
+        Events::new(response, session)
     }
 
     pub fn pending(&self, owner: &Owner, session: &Session) -> Result<Vec<PermissionRequest>> {

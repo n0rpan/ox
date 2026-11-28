@@ -10,7 +10,11 @@ use crate::{
     transcript::Transcript,
 };
 use serde_json::{Value, json};
-use std::{collections::HashMap, io, sync::mpsc::SyncSender};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    sync::mpsc::SyncSender,
+};
 
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 
@@ -36,6 +40,12 @@ pub enum Event {
         key: String,
         result: Result<Option<String>, String>,
     },
+    StreamText {
+        thread: String,
+        part: String,
+        delta: String,
+    },
+    StreamLost,
     Closed(String),
 }
 
@@ -55,6 +65,7 @@ pub struct Project {
     timelines: HashMap<String, Timeline>,
     asks: HashMap<String, Vec<AskView>>,
     sequences: HashMap<String, u64>,
+    volatile: HashMap<String, HashSet<String>>,
 }
 
 impl Store {
@@ -69,6 +80,7 @@ impl Store {
                 timelines: HashMap::new(),
                 asks: HashMap::new(),
                 sequences: HashMap::new(),
+                volatile: HashMap::new(),
             })),
         )
     }
@@ -295,7 +307,18 @@ impl Store {
                         .push((pending.client, key, result));
                 }
             }
+            Event::StreamText {
+                thread,
+                part,
+                delta,
+            } => {
+                self.opencode_stream_text(thread, part, delta);
+            }
+            Event::StreamLost => {
+                self.opencode_reset_streams()?;
+            }
             Event::Closed(reason) => {
+                self.opencode_reset_streams()?;
                 self.state = Connection::Closed(reason.clone());
                 self.asks.clear();
                 self.opencode_mut().asks.clear();
@@ -313,6 +336,82 @@ impl Store {
                 );
                 self.changed
                     .mark(Changed::CONNECTION | Changed::THREADS | Changed::ASK);
+            }
+        }
+        Ok(())
+    }
+
+    fn opencode_stream_text(&mut self, thread: String, part: String, delta: String) {
+        let Some(turn) = self.opencode().timelines.get(&thread).and_then(|timeline| {
+            let active = timeline.detail["active"].as_str()?;
+            timeline
+                .items
+                .iter()
+                .rev()
+                .find(|item| {
+                    item.id == part
+                        && item.role == "assistant"
+                        && item.turn == active
+                        && item.text.is_empty()
+                })
+                .map(|item| item.turn.clone())
+        }) else {
+            return;
+        };
+        let Some(transcript) = self.transcripts.get_mut(&thread) else {
+            return;
+        };
+        transcript.observe_delta(
+            turn,
+            part.clone(),
+            crate::transcript::DeltaTarget::Agent,
+            delta,
+        );
+        self.changed.transcript(&thread);
+        self.opencode_mut()
+            .volatile
+            .entry(thread)
+            .or_default()
+            .insert(part);
+    }
+
+    fn opencode_reset_streams(&mut self) -> io::Result<()> {
+        let pending = std::mem::take(&mut self.opencode_mut().volatile);
+        for (thread, parts) in pending {
+            self.opencode_reset_parts(&thread, &parts)?;
+        }
+        Ok(())
+    }
+
+    fn opencode_reset_parts(&mut self, thread: &str, parts: &HashSet<String>) -> io::Result<()> {
+        let authoritative: Vec<_> = self
+            .opencode()
+            .timelines
+            .get(thread)
+            .into_iter()
+            .flat_map(|timeline| {
+                timeline
+                    .items
+                    .iter()
+                    .filter(|item| parts.contains(&item.id))
+                    .cloned()
+            })
+            .collect();
+        let Some(t) = self.transcripts.get_mut(thread) else {
+            return Ok(());
+        };
+        for mut item in authoritative {
+            let key = crate::transcript::ItemKey {
+                turn: item.turn.clone(),
+                item: item.id.clone(),
+            };
+            if let Some(entry) = t.entry(&key)
+                && let crate::transcript::item::Item::AgentMessage { text, .. } = &entry.item
+                && text != &item.text
+            {
+                item.revision = entry.revision + 1;
+                replica::apply_item(t, item)?;
+                self.changed.transcript(thread);
             }
         }
         Ok(())
@@ -354,6 +453,11 @@ impl Store {
         asks: Vec<AskView>,
     ) -> io::Result<()> {
         let id = session.id.clone();
+        if !timeline.detail["active"].is_string()
+            && let Some(parts) = self.opencode_mut().volatile.remove(&id)
+        {
+            self.opencode_reset_parts(&id, &parts)?;
+        }
         let last_result = session.last_result();
         self.opencode_row(session);
         let old = self
@@ -467,5 +571,88 @@ fn as_ask(view: &AskView) -> Ask {
                 decision
             })
             .collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        host_protocol::{Scope, TimelineItem},
+        runtime::Runtime,
+    };
+
+    #[test]
+    fn losing_the_native_feed_discards_only_unpersisted_text() {
+        let route = Runtime::OpenCode.route(Some("api/model".into()));
+        let scope = Scope {
+            project: "/fixture".into(),
+            route,
+        };
+        let (tx, _commands) = std::sync::mpsc::sync_channel(1);
+        let mut store = Store::open_opencode(
+            Profile {
+                project: scope.project.clone(),
+                route: scope.route.clone(),
+                provider: "opencode".into(),
+            },
+            tx,
+        );
+        let snapshot = |text: &str, active: Option<&str>| Event::Snapshot {
+            session: Box::new(SessionView {
+                id: "thread".into(),
+                title: "Thread".into(),
+                parent: None,
+                status: if active.is_some() { "running" } else { "idle" }.into(),
+                updated_at: 1,
+                capabilities: Vec::new(),
+                detail: json!({ "owned": true }),
+            }),
+            transcript: Timeline {
+                detail: json!({"active": active, "ready": true}),
+                items: vec![TimelineItem {
+                    turn: "turn".into(),
+                    id: "part".into(),
+                    role: "assistant".into(),
+                    text: text.into(),
+                    revision: 0,
+                    detail: Value::Null,
+                }],
+            },
+            asks: Vec::new(),
+            sequence: Some(1),
+        };
+        let partial = || Event::StreamText {
+            thread: "thread".into(),
+            part: "part".into(),
+            delta: "first".into(),
+        };
+        let display = |store: &Store| {
+            store.host_snapshot(&scope).transcripts["thread"].items[0]
+                .text
+                .clone()
+        };
+        store.opencode_event(snapshot("", Some("turn"))).unwrap();
+        store.opencode_event(partial()).unwrap();
+        store.opencode_event(snapshot("", Some("turn"))).unwrap();
+        assert_eq!(
+            display(&store),
+            "first",
+            "unchanged authority preserves the temporary prefix"
+        );
+        store.opencode_event(Event::StreamLost).unwrap();
+        assert_eq!(display(&store), "");
+        store.opencode_event(partial()).unwrap();
+        store
+            .opencode_event(snapshot("first restored", None))
+            .unwrap();
+        store.opencode_event(Event::StreamLost).unwrap();
+        assert_eq!(display(&store), "first restored");
+        store.opencode_event(partial()).unwrap();
+        assert_eq!(
+            display(&store),
+            "first restored",
+            "late fragments cannot change a finished turn"
+        );
     }
 }

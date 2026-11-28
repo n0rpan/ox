@@ -1,4 +1,7 @@
 //! Explicit local enrollment for the stock OpenCode runtime experiment.
+mod observer;
+
+use observer::Observer;
 use ox_desk_core::{
     host_protocol::{AskView, Scope, SessionView, Timeline},
     links::LinkEvent,
@@ -23,6 +26,7 @@ use std::{
 use uuid::Uuid;
 
 const ACTIVE_REFRESH: Duration = Duration::from_millis(250);
+const DISPLAY_REFRESH: Duration = Duration::from_millis(50);
 const PROJECT: &str = "OX_EXPERIMENTAL_HOSTED_OPENCODE_PROJECT";
 const ALIAS: &str = "OX_EXPERIMENTAL_HOSTED_OPENCODE_ALIAS";
 
@@ -59,6 +63,7 @@ pub(super) fn open(
                     owner,
                     active: HashSet::new(),
                     cached: HashMap::new(),
+                    observer: Observer::default(),
                     deliver: &deliver,
                 }
                 .run(&rx)
@@ -89,6 +94,7 @@ struct Worker<'a> {
     owner: Owner,
     active: HashSet<Uuid>,
     cached: HashMap<Uuid, Cached>,
+    observer: Observer,
     deliver: &'a dyn Fn(Event),
 }
 
@@ -105,6 +111,7 @@ impl Worker<'_> {
             rows.into_iter().map(|(_, row, _)| row).collect(),
         ));
         let mut next_refresh = Instant::now();
+        let mut next_display = next_refresh;
         loop {
             let message = if self.active.is_empty() {
                 match rx.recv() {
@@ -112,7 +119,11 @@ impl Worker<'_> {
                     Err(_) => break,
                 }
             } else {
-                match rx.recv_timeout(next_refresh.saturating_duration_since(Instant::now())) {
+                match rx.recv_timeout(
+                    next_refresh
+                        .min(next_display)
+                        .saturating_duration_since(Instant::now()),
+                ) {
                     Ok(message) => Some(message),
                     Err(RecvTimeoutError::Timeout) => None,
                     Err(RecvTimeoutError::Disconnected) => break,
@@ -121,6 +132,12 @@ impl Worker<'_> {
             if let Some((key, command)) = message {
                 let result = self.command(command).map_err(|error| error.to_string());
                 (self.deliver)(Event::Finished { key, result });
+            }
+            if !self.active.is_empty() && Instant::now() >= next_display {
+                if self.refresh_observations()? {
+                    next_refresh = Instant::now() + ACTIVE_REFRESH;
+                }
+                next_display = Instant::now() + DISPLAY_REFRESH;
             }
             if !self.active.is_empty() && Instant::now() >= next_refresh {
                 let active: Vec<_> = self.active.iter().copied().collect();
@@ -166,6 +183,10 @@ impl Worker<'_> {
                     .receipt(owner, id)?
                     .map_or(0, |receipt| receipt.sequence);
                 let sequence = previous.checked_add(1).ok_or(Error::ConflictingSend)?;
+                if self.observer.poll(&self.runtime, owner, &self.active) {
+                    (self.deliver)(Event::StreamLost);
+                }
+                self.observer.connect(&self.runtime, owner);
                 match self.runtime.send(owner, id, sequence, &text) {
                     Ok(_) | Err(Error::AmbiguousSend) => {
                         self.active.insert(id);
@@ -201,6 +222,35 @@ impl Worker<'_> {
             }
         }
         Ok(None)
+    }
+
+    fn refresh_observations(&mut self) -> Result<bool, Error> {
+        let disconnected = self.observer.poll(&self.runtime, &self.owner, &self.active);
+        if disconnected {
+            let active: Vec<_> = self.active.iter().copied().collect();
+            for id in active {
+                self.refresh(id, false)?;
+            }
+            (self.deliver)(Event::StreamLost);
+        }
+        self.observer.connect(&self.runtime, &self.owner);
+        let missing = self
+            .observer
+            .unknown_parts(|id, part| known_part(&self.cached, id, part));
+        for id in missing {
+            self.refresh(id, false)?;
+        }
+        self.observer.flush(
+            |id, part| known_part(&self.cached, id, part),
+            |id, part, delta| {
+                (self.deliver)(Event::StreamText {
+                    thread: id.to_string(),
+                    part: part.to_owned(),
+                    delta,
+                })
+            },
+        );
+        Ok(disconnected)
     }
 
     fn refresh(&mut self, id: Uuid, older: bool) -> Result<(), Error> {
@@ -249,6 +299,18 @@ impl Worker<'_> {
         });
         Ok(())
     }
+}
+
+fn known_part(cached: &HashMap<Uuid, Cached>, id: Uuid, part: &str) -> bool {
+    cached.get(&id).is_some_and(|cached| {
+        cached.timeline.detail["active"]
+            .as_str()
+            .is_some_and(|turn| {
+                cached.timeline.items.iter().rev().any(|p| {
+                    p.id == part && p.role == "assistant" && p.turn == turn && p.text.is_empty()
+                })
+            })
+    })
 }
 
 fn in_progress(phase: Phase) -> bool {

@@ -274,6 +274,20 @@ impl RouteRuntime {
         self.hosted.adapter.events(owner, &native)
     }
 
+    pub fn route_events(&self, owner: &Owner) -> Result<Events> {
+        self.check_owner(owner)?;
+        self.hosted.adapter.route_events(owner)
+    }
+
+    /// Translate an authenticated native event to an already opened host session.
+    pub fn opened_session(&self, owner: &Owner, native: &str) -> Result<Option<Uuid>> {
+        self.check_owner(owner)?;
+        Ok(self
+            .sessions
+            .iter()
+            .find_map(|(id, session)| (session.native.id() == native).then_some(*id)))
+    }
+
     pub fn answer(
         &mut self,
         owner: &Owner,
