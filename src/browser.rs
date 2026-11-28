@@ -10,7 +10,6 @@ use std::io::{self, Read, Write};
 use std::net::Ipv6Addr;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
@@ -36,7 +35,7 @@ Verify a local app with a shared browser session.
 
 Usage: ox browser [--session NAME] [--allow-host HOST] <command>
 
-  install                         Install or refresh the browser component
+  install [--allow-fresh]         Install or refresh the browser component
   open http://localhost:3000      Open your local app
   snapshot [--json]               Read the page and get element references
   fill @e1 TEXT                   Fill a field from the latest snapshot
@@ -45,8 +44,9 @@ Usage: ox browser [--session NAME] [--allow-host HOST] <command>
   screenshot FILE.png             Save a screenshot to the given path
   close                           Close the browser session
 
-Install selects a stable release published at least 24 hours ago. Open sessions
-keep their component until closed.
+Install requires a stable release and binary published at least 24 hours ago.
+Use install --allow-fresh for an urgent stable release. Open sessions keep
+their component until closed.
 
 Run commands from the same Git worktree or, outside Git, the same directory.
 Use --session NAME to keep two conversations in that worktree separate.
@@ -59,7 +59,7 @@ pub(crate) fn print_usage() {
 
 enum Action<'a> {
     Help,
-    Install,
+    Install { allow_fresh: bool },
     Open(Url),
     Snapshot { json: bool },
     Fill(&'a OsStr, &'a str),
@@ -89,7 +89,10 @@ fn parse(mut args: &[OsString]) -> Result<(Scope<'_>, Action<'_>), RelayError> {
     let action = match args {
         [] => Action::Help,
         [arg] if matches!(arg.to_str(), Some("-h" | "--help" | "help")) => Action::Help,
-        [arg] if arg == "install" => Action::Install,
+        [arg] if arg == "install" => Action::Install { allow_fresh: false },
+        [arg, flag] if arg == "install" && flag == "--allow-fresh" => {
+            Action::Install { allow_fresh: true }
+        }
         [arg, url] if arg == "open" => Action::Open(dev_url(
             url.to_str().ok_or("The URL must be UTF-8.")?,
             allowed_host.as_deref(),
@@ -377,19 +380,24 @@ fn write_private_file(path: &Path, data: &str) -> Result<(), RelayError> {
     Ok(())
 }
 
-fn lock_scope(states: &Path, session: &str) -> Result<fs::File, RelayError> {
+fn lock_scope(states: &Path, session: &str, exclusive: bool) -> Result<fs::File, RelayError> {
     private_dir(states)?;
     if !private_directory(states)? {
         return Err("The OX Browser session directory became unavailable.".into());
     }
     let lock = fs::File::options()
         .create(true)
+        .read(true)
         .write(true)
         .truncate(false)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(states.join(format!("{session}.lock")))?;
-    lock.lock()?;
+    if exclusive {
+        lock.lock()?;
+    } else {
+        lock.lock_shared()?;
+    }
     Ok(lock)
 }
 
@@ -433,21 +441,16 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
         return Ok(0);
     }
     let root = component_dir()?;
-    if matches!(action, Action::Install) {
+    if let Action::Install { allow_fresh } = action {
         private_dir(&root)?;
         if !private_directory(&root)? {
             return Err("The OX Browser directory became unavailable. Retry installation.".into());
         }
-        return component::install(&root).await;
+        return component::install(&root, allow_fresh).await;
     }
-    let installed = if private_directory(&root)? {
-        Installed::load(&root)?
-    } else {
-        None
-    };
-    let Some(mut installed) = installed else {
+    if !private_directory(&root)? {
         return component_unavailable(&action);
-    };
+    }
     let cwd = env::current_dir()?.canonicalize()?;
     let session = session_name(
         worktree_root(&cwd),
@@ -456,11 +459,13 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     );
     let states = root.join("scopes");
     let opening = matches!(action, Action::Open(_));
-    // Serialize open calls for this scope across a concurrent component refresh.
-    let _open_lock = opening.then(|| lock_scope(&states, &session)).transpose()?;
-    if opening {
-        installed = Installed::load(&root)?.ok_or("OX Browser is not installed.")?;
-    }
+    // Hold the lock through the subprocess so a queued command cannot revive
+    // a scope after close. A passive query can also restart an empty daemon.
+    let exclusive = opening || matches!(action, Action::Close);
+    let _scope_lock = lock_scope(&states, &session, exclusive)?;
+    let Some(installed) = Installed::load(&root)? else {
+        return component_unavailable(&action);
+    };
     let (component, sockets) =
         match active_component(&root, &states, &session, installed.legacy.as_ref())? {
             Some(active) => active,
@@ -495,9 +500,7 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
         &domains,
         "--content-boundaries",
     ]);
-    if matches!(action, Action::Open(_))
-        && let Some(browser) = system_browser()?
-    {
+    if opening && let Some(browser) = system_browser()? {
         command.arg("--executable-path").arg(
             browser
                 .to_str()
@@ -507,7 +510,7 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
     match action {
         Action::Open(url) => {
             write_private_file(&states.join(&session), component.id())?;
-            return Ok(exit_code(command.args(["open", url.as_str()]).status()?));
+            command.args(["open", url.as_str()]);
         }
         Action::Snapshot { json } => {
             command.args(["snapshot", "--compact"]);
@@ -530,11 +533,12 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
         Action::Close => {
             command.arg("close");
         }
-        Action::Help | Action::Install => unreachable!(),
+        Action::Help | Action::Install { .. } => unreachable!(),
     }
-    // Use the caller's process for ordinary actions so the wrapper does not
-    // keep an additional process alive while Chromium handles the command.
-    Err(format!("Could not start agent-browser: {}.", command.exec()).into())
+    let status = command
+        .status()
+        .map_err(|error| format!("Could not start agent-browser: {error}."))?;
+    Ok(exit_code(status))
 }
 
 fn preview(command: &mut Command) -> Result<u8, RelayError> {
@@ -611,6 +615,22 @@ fn exit_code(status: ExitStatus) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fresh_release_override_requires_an_explicit_install_flag() {
+        let default = [OsString::from("install")];
+        assert!(matches!(
+            parse(&default).unwrap().1,
+            Action::Install { allow_fresh: false }
+        ));
+        let override_args = [OsString::from("install"), OsString::from("--allow-fresh")];
+        assert!(matches!(
+            parse(&override_args).unwrap().1,
+            Action::Install { allow_fresh: true }
+        ));
+        let invalid = [OsString::from("preview"), OsString::from("--allow-fresh")];
+        assert!(parse(&invalid).is_err());
+    }
 
     #[test]
     fn dev_urls_are_http_loopback_without_credentials() {

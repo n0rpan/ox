@@ -167,8 +167,13 @@ fn select_release(
     releases: Vec<UpstreamRelease>,
     platform: &'static str,
     now: DateTime<Utc>,
+    allow_fresh: bool,
 ) -> Result<Asset, RelayError> {
-    let cutoff = now - MIN_RELEASE_AGE;
+    let cutoff = if allow_fresh {
+        now
+    } else {
+        now - MIN_RELEASE_AGE
+    };
     let mut eligible: Vec<_> = releases
         .into_iter()
         .filter_map(|release| {
@@ -217,6 +222,11 @@ fn select_release(
         )
         .into());
     }
+    if allow_fresh {
+        return Err(
+            "No published stable agent-browser release has a matching platform binary.".into(),
+        );
+    }
     Err("No stable agent-browser release and matching platform binary have been published for at least 24 hours.".into())
 }
 
@@ -231,7 +241,7 @@ fn download_client() -> Result<reqwest::Client, RelayError> {
     Ok(builder.build()?)
 }
 
-async fn resolve_asset(client: &reqwest::Client) -> Result<Asset, RelayError> {
+async fn resolve_asset(client: &reqwest::Client, allow_fresh: bool) -> Result<Asset, RelayError> {
     let platform = platform_asset()?;
     let mut releases = Vec::new();
     // GitHub lists releases by creation order. Publication order can differ.
@@ -253,7 +263,12 @@ async fn resolve_asset(client: &reqwest::Client) -> Result<Asset, RelayError> {
             break;
         }
     }
-    select_release(releases, platform, std::time::SystemTime::now().into())
+    select_release(
+        releases,
+        platform,
+        std::time::SystemTime::now().into(),
+        allow_fresh,
+    )
 }
 
 fn verify_binary(path: &Path, asset: &Asset) -> io::Result<bool> {
@@ -405,7 +420,7 @@ async fn check_contract(
     Ok(())
 }
 
-pub(super) async fn install(root: &Path) -> Result<u8, RelayError> {
+pub(super) async fn install(root: &Path, allow_fresh: bool) -> Result<u8, RelayError> {
     let _lock = crate::update::store_lock(root, false)?;
     let browser = super::system_browser()?;
     if browser.is_none() && cfg!(all(target_os = "linux", target_arch = "aarch64")) {
@@ -417,7 +432,7 @@ pub(super) async fn install(root: &Path) -> Result<u8, RelayError> {
     let legacy = legacy_component(root)?;
     let client = download_client()?;
     println!("Checking for an eligible agent-browser release…");
-    let asset = resolve_asset(&client)
+    let asset = resolve_asset(&client, allow_fresh)
         .await
         .map_err(|error| format!("Could not select an agent-browser release: {error}"))?;
     let component = asset.component();
@@ -515,29 +530,53 @@ mod tests {
             fixture("v0.46.0", 1440),
             fixture("v0.45.0", 2800),
         ];
-        let selected = select_release(releases, PLATFORM, now()).unwrap();
+        let selected = select_release(releases, PLATFORM, now(), false).unwrap();
         assert_eq!(selected.version, "0.46.0");
         assert_eq!(selected.sha256, HASH);
         assert_eq!(selected.size, 16);
     }
 
     #[test]
+    fn allow_fresh_skips_only_the_release_and_asset_wait() {
+        for replaced_asset in [false, true] {
+            for (allow_fresh, expected) in [(false, "0.45.0"), (true, "0.46.0")] {
+                let mut candidate = fixture("v0.46.0", if replaced_asset { 1440 } else { 1439 });
+                if replaced_asset {
+                    candidate.assets[0].updated_at = now() - Duration::from_secs(60);
+                }
+                let mut draft = fixture("v0.49.0", 5);
+                draft.draft = true;
+                let mut prerelease = fixture("v0.48.0", 10);
+                prerelease.prerelease = true;
+                let mut wrong_platform = fixture("v0.47.0", 15);
+                wrong_platform.assets[0].name = "agent-browser-linux-x64-musl".to_owned();
+                let older = fixture("v0.45.0", 2880);
+                let releases = vec![draft, prerelease, wrong_platform, candidate, older];
+                let selected = select_release(releases, PLATFORM, now(), allow_fresh).unwrap();
+                assert_eq!(selected.version, expected);
+            }
+        }
+    }
+
+    #[test]
     fn refuses_newest_matching_asset_with_invalid_verification_metadata() {
-        for (size, digest) in [
-            (0, Some(format!("sha256:{HASH}"))),
-            (MAX_BINARY_BYTES + 1, Some(format!("sha256:{HASH}"))),
-            (16, None),
-            (16, Some(format!("sha512:{HASH}"))),
-            (16, Some("sha256:not-a-checksum".to_owned())),
-        ] {
-            let mut latest = fixture("v0.46.0", 1440);
-            latest.assets[0].size = size;
-            latest.assets[0].digest = digest;
-            let older = fixture("v0.45.0", 2800);
-            let error = select_release(vec![older, latest], PLATFORM, now())
-                .err()
-                .unwrap();
-            assert!(error.to_string().contains("invalid"));
+        for allow_fresh in [false, true] {
+            for (size, digest) in [
+                (0, Some(format!("sha256:{HASH}"))),
+                (MAX_BINARY_BYTES + 1, Some(format!("sha256:{HASH}"))),
+                (16, None),
+                (16, Some(format!("sha512:{HASH}"))),
+                (16, Some("sha256:not-a-checksum".to_owned())),
+            ] {
+                let mut latest = fixture("v0.46.0", if allow_fresh { 10 } else { 1440 });
+                latest.assets[0].size = size;
+                latest.assets[0].digest = digest;
+                let older = fixture("v0.45.0", 2800);
+                let error = select_release(vec![older, latest], PLATFORM, now(), allow_fresh)
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("invalid"));
+            }
         }
     }
 
@@ -545,7 +584,7 @@ mod tests {
     fn existing_component_must_match_the_size_and_hash_at_install() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("browser");
-        let asset = select_release(vec![fixture("v0.45.0", 1440)], PLATFORM, now()).unwrap();
+        let asset = select_release(vec![fixture("v0.45.0", 1440)], PLATFORM, now(), false).unwrap();
         assert!(!verify_binary(&path, &asset).unwrap());
         fs::write(&path, b"verified release").unwrap();
         assert!(verify_binary(&path, &asset).unwrap());
@@ -563,10 +602,10 @@ mod tests {
         let legacy = Component::parse("0.44.0").unwrap();
         let older = fixture("v0.45.0", 2880);
         let newer = fixture("v0.46.0", 1440);
-        let current = select_release(vec![older], PLATFORM, now())
+        let current = select_release(vec![older], PLATFORM, now(), false)
             .unwrap()
             .component();
-        let replacement = select_release(vec![newer], PLATFORM, now())
+        let replacement = select_release(vec![newer], PLATFORM, now(), false)
             .unwrap()
             .component();
         for component in [&legacy, &current, &replacement] {
@@ -617,11 +656,11 @@ mod tests {
     async fn incompatible_component_cannot_change_current_selection() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
-        let current = select_release(vec![fixture("v0.45.0", 2880)], PLATFORM, now())
+        let current = select_release(vec![fixture("v0.45.0", 2880)], PLATFORM, now(), false)
             .unwrap()
             .component();
         activate(root, &current, None).unwrap();
-        let candidate = select_release(vec![fixture("v0.46.0", 1440)], PLATFORM, now())
+        let candidate = select_release(vec![fixture("v0.46.0", 1440)], PLATFORM, now(), false)
             .unwrap()
             .component();
         let path = candidate.path(root);
