@@ -55,6 +55,9 @@ class Provider(BaseHTTPRequestHandler):
             return
         last_user = next(row["content"] for row in reversed(payload["messages"]) if row["role"] == "user")
         case = " ".join(part.get("text", "") for part in last_user if part["type"] == "text")
+        self.respond(case)
+
+    def respond(self, case):
         filename = SHELL_CASES.get(case)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -70,14 +73,15 @@ class Provider(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def stream(self, case, filename):
+        response_id = secrets.token_hex(8)
         self.write_event("message_start", message={
-            "id": "msg_fixture", "type": "message", "role": "assistant", "model": "local",
+            "id": f"msg_fixture_{response_id}", "type": "message", "role": "assistant", "model": "local",
             "content": [], "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": 12, "output_tokens": 0},
         })
         if filename:
             self.write_event("content_block_start", index=0, content_block={
-                "type": "tool_use", "id": "toolu_fixture", "name": "bash", "input": {},
+                "type": "tool_use", "id": f"toolu_fixture_{response_id}", "name": "bash", "input": {},
             })
             self.write_event("content_block_delta", index=0, delta={
                 "type": "input_json_delta", "partial_json": json.dumps({
