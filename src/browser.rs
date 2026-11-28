@@ -493,8 +493,6 @@ pub(crate) async fn run(args: &[OsString]) -> Result<u8, RelayError> {
         &session,
         "--allowed-domains",
         &domains,
-        "--idle-timeout",
-        "10m",
         "--content-boundaries",
     ]);
     if matches!(action, Action::Open(_))

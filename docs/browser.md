@@ -38,7 +38,7 @@ ox browser --session lan --allow-host devbox.lan preview
 ox browser --session lan --allow-host devbox.lan close
 ```
 
-Each session uses a fresh browser profile and closes after ten minutes without browser activity or when you run `ox browser close`. The preview listens on the local host and can accept input.
+Each session uses a fresh browser profile and follows the installed browser component's idle behavior. Run `ox browser close` when you're done. The preview listens on the local host and can accept input.
 
 ## Check the verification flow
 
