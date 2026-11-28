@@ -333,6 +333,10 @@ def run(opencode, ox, root, provider):
         wait(ready, "OX gateway model catalog")
         assert api.read("/global/health", authenticate=False, status=401) is None
         assert api.read("/global/health") == {"healthy": True, "version": VERSION}
+        native = api.read("/path")
+        assert native["directory"] == str(paths["project"])
+        assert native["state"] == str(paths["state"] / "opencode")
+        assert native["config"] == str(paths["config"] / "opencode")
         session = api.read("/session", {"title": "OX host contract"})
         other = api.read("/session", {"title": "Another project"}, project=paths["other"])
         assert session["projectID"] != other["projectID"]

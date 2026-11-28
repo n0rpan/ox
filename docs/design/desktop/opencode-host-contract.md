@@ -24,4 +24,12 @@ The fixture starts the real OpenCode server and passes an OX alias through the r
 
 The stock binary also advertises ACP. In the pinned upstream implementation, ACP load reads and replays complete history. ACP resume reads up to 20 messages to restore settings and emits no history replay. HTTP gives the first adapter an explicit history cursor and pending-request reads. The OX transport can be revisited after a cross-client latency comparison. [ACP load and resume implementation](https://github.com/anomalyco/opencode/blob/v1.19.6/packages/opencode/src/acp/service.ts)
 
-The fixture covers the Linux stock process, the OX Messages path, and the native server contract. An OX session adapter, actual desktop and phone behavior, other provider formats, and macOS have separate implementation and verification work.
+## Independently tested Rust adapter
+
+The adapter lives in the host package and reuses its existing blocking HTTP transport and OX's shared bounded SSE parser. It prepares separate cache, config, data, and state directories for each canonical owner. It takes the loopback address and authentication secret from the caller that started the child. It checks the supported version and compares the native project, config, and state paths with that owner's profile before it accepts requests.
+
+```sh
+cargo test --locked --manifest-path desktop/Cargo.toml -p ox-host --lib
+```
+
+The unit tests exercise authenticated routes against a bounded loopback fixture. They cover owner partitioning, wrong-owner rejection, prompt model binding, history cursors, scoped SSE, and the cancellation fence after an ambiguous error. The stock fixture above separately verifies the wire contract and reported paths on Linux. The host still needs a child launcher tied to the gateway's route, checks against its durable session registry, a dedicated I/O worker, and desktop and phone projection tests. macOS needs its own runtime verification.
