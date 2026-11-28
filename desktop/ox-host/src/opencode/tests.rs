@@ -3,8 +3,17 @@ use serde_json::json;
 use std::{
     io::{BufRead as _, BufReader, Write as _},
     net::{SocketAddr, TcpListener},
+    os::unix::fs::PermissionsExt as _,
     path::Path,
 };
+
+// Production's SocketGuard prepares the host state with mode 0700.
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
 
 fn owner(root: &Path, host: &str, alias: &str) -> Owner {
     Owner::new(host.into(), root, alias.into()).unwrap()
@@ -12,8 +21,8 @@ fn owner(root: &Path, host: &str, alias: &str) -> Owner {
 
 #[test]
 fn partitions_by_host_project_and_billing_route() {
-    let root = tempfile::tempdir().unwrap();
-    let other = tempfile::tempdir().unwrap();
+    let root = private_tempdir();
+    let other = private_tempdir();
     let first = owner(root.path(), "host", "provider/model");
     let profiles: HashSet<_> = [
         first.clone(),
@@ -147,7 +156,7 @@ fn startup(profile: &Profile) -> Vec<Exchange> {
 
 #[test]
 fn scopes_actions_history_and_stream_to_a_registered_session() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let project = tmp.path().join("project #1");
     std::fs::create_dir(&project).unwrap();
     let first = owner(&project, "host", "provider/model");
@@ -209,8 +218,8 @@ fn scopes_actions_history_and_stream_to_a_registered_session() {
 
 #[test]
 fn requires_the_owning_child_profile() {
-    let tmp = tempfile::tempdir().unwrap();
-    let other_state = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
+    let other_state = private_tempdir();
     let scope = owner(tmp.path(), "host", "provider/model");
     let intended = Profile::prepare(tmp.path(), scope.clone()).unwrap();
     let foreign = Profile::prepare(other_state.path(), scope.clone()).unwrap();
@@ -226,7 +235,7 @@ fn requires_the_owning_child_profile() {
 
 #[test]
 fn fences_an_ambiguous_stop_until_the_exact_stale_ask_is_gone() {
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let scope = owner(tmp.path(), "host", "provider/model");
     let profile = Profile::prepare(tmp.path(), scope.clone()).unwrap();
     let mut script = startup(&profile);
