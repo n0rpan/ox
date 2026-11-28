@@ -50,12 +50,11 @@ pub enum Event {
 }
 
 struct Pending {
-    client: u64,
     sending: Option<Option<String>>,
     submitted: Option<String>,
 }
 
-pub type Completion = (u64, String, Result<Option<String>, String>);
+pub type Completion = (String, Result<Option<String>, String>);
 
 pub struct Project {
     tx: SyncSender<(String, Command)>,
@@ -103,12 +102,8 @@ impl Store {
         project
     }
 
-    pub fn opencode_has_pending_requests(&self) -> bool {
-        !self.opencode().pending.is_empty()
-    }
-
-    pub fn opencode_waiter(&mut self, key: &str) -> Option<&mut u64> {
-        Some(&mut self.opencode_mut().pending.get_mut(key)?.client)
+    pub fn opencode_has_pending(&self, key: &str) -> bool {
+        self.opencode().pending.contains_key(key)
     }
 
     pub fn take_opencode_completions(&mut self) -> Vec<Completion> {
@@ -151,9 +146,8 @@ impl Store {
             })
     }
 
-    pub fn dispatch_opencode(&mut self, client: u64, key: &str, action: Action) -> io::Result<()> {
+    pub fn dispatch_opencode(&mut self, key: &str, action: Action) -> io::Result<()> {
         let mut pending = Pending {
-            client,
             sending: None,
             submitted: None,
         };
@@ -302,9 +296,7 @@ impl Store {
                     if let Ok(Some(id)) = &result {
                         self.selected = Some(id.clone());
                     }
-                    self.opencode_mut()
-                        .completed
-                        .push((pending.client, key, result));
+                    self.opencode_mut().completed.push((key, result));
                 }
             }
             Event::StreamText {
@@ -329,11 +321,9 @@ impl Store {
                     self.changed.transcript(id);
                 }
                 let pending = std::mem::take(&mut self.opencode_mut().pending);
-                self.opencode_mut().completed.extend(
-                    pending
-                        .into_iter()
-                        .map(|(key, p)| (p.client, key, Err(reason.clone()))),
-                );
+                self.opencode_mut()
+                    .completed
+                    .extend(pending.into_keys().map(|key| (key, Err(reason.clone()))));
                 self.changed
                     .mark(Changed::CONNECTION | Changed::THREADS | Changed::ASK);
             }

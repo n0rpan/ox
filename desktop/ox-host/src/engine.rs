@@ -236,6 +236,8 @@ struct Live {
     /// thread/start. Its launcher hears the outcome only once they do.
     confirming: Option<Confirming>,
     opening: Option<(u64, String)>,
+    /// Actions waiting for the owning runtime, keyed by action ID.
+    awaiting_input: HashMap<String, AwaitingInput>,
     terminal: Option<(u64, String)>,
     schema_started: bool,
     recovered: Vec<wire::SessionView>,
@@ -250,6 +252,12 @@ struct Live {
     /// next scoped subscriber (or a replayed request) receives it until the
     /// deadline, after which it is dropped so the runtime can be reaped.
     held_handoff: Option<(String, Server, Instant)>,
+}
+
+struct AwaitingInput {
+    client: u64,
+    codex_thread: Option<String>,
+    digest: [u8; 32],
 }
 
 /// How long a terminal handoff waits for a client to take it before it is dropped.
@@ -1091,12 +1099,32 @@ impl Engine {
                         fail("Open this project and billing route before sending actions".into()),
                     );
                 };
+                let hash = digest(&action, &approval)?;
+                if let Some(input) = self
+                    .running
+                    .get_mut(&scope)
+                    .unwrap()
+                    .awaiting_input
+                    .get_mut(&key)
+                {
+                    if input.digest != hash {
+                        return self.reply(
+                            id,
+                            fail("Action ID was reused for a different request".into()),
+                        );
+                    }
+                    // Connections are numbered in accept order. The retry can arrive
+                    // before the old socket's Disconnect, or an old write can arrive late.
+                    if id > input.client || !self.clients.contains_key(&input.client) {
+                        input.client = id;
+                    }
+                    return Ok(());
+                }
                 if (self.draining.is_some() || self.update_reserved())
                     && crate::handover::starts_work(&action)
                 {
                     return self.reply(id, fail(crate::handover::REFUSAL.into()));
                 }
-                let hash = digest(&action, &approval)?;
                 match self
                     .receipts
                     .get(&scope, &key, generation, hash)
@@ -1146,6 +1174,14 @@ impl Engine {
                     Ok(None) => (),
                 }
                 let ends = matches!(action, Action::EndSession(_) | Action::ForceEndSession(_));
+                let input_thread = match &action {
+                    Action::SendText(Some(thread), _) | Action::SendImages(Some(thread), _, _)
+                        if scope.route.runtime == ox_desk_core::runtime::Runtime::Codex =>
+                    {
+                        Some(thread.clone())
+                    }
+                    _ => None,
+                };
                 let result = match self.act(id, &key, &scope, action, approval) {
                     Ok(()) => Server::Ack { id: key.clone() },
                     Err(e) => fail(e.to_string()),
@@ -1153,8 +1189,32 @@ impl Engine {
                 let accepted = matches!(result, Server::Ack { .. });
                 // Only accepted actions are receipts. A refusal is often transient, so a corrected
                 // retry with the same key must run again rather than replay the refusal.
-                let waiting = accepted && self.waiting_open_client(&scope, &key).is_some();
-                if accepted {
+                let awaiting_input = accepted
+                    && (scope.route.runtime == Runtime::OpenCode || input_thread.is_some())
+                    && self.running.get_mut(&scope).is_some_and(|live| {
+                        let waiting = if scope.route.runtime == Runtime::OpenCode {
+                            live.store.opencode_has_pending(&key)
+                        } else {
+                            input_thread
+                                .as_deref()
+                                .is_some_and(|thread| live.store.track_codex_input(thread))
+                        };
+                        if waiting {
+                            live.awaiting_input.insert(
+                                key.clone(),
+                                AwaitingInput {
+                                    client: id,
+                                    codex_thread: input_thread,
+                                    digest: hash,
+                                },
+                            );
+                        }
+                        waiting
+                    });
+                let waiting = awaiting_input
+                    || (accepted && self.waiting_open_client(&scope, &key).is_some());
+                // Keep in-flight input outside the bounded completed-receipt cache.
+                if accepted && !awaiting_input {
                     self.receipts
                         .insert(scope.clone(), key, generation, hash, result.clone());
                 }
@@ -1427,6 +1487,11 @@ impl Engine {
                 .ok()
                 .flatten();
             store.restore_ended(&saved.id, &saved.title, saved.updated_at, access);
+            if let Ok(attachment) =
+                serde_json::from_value(saved.detail["memory_attachment"].clone())
+            {
+                store.remember_memory_attachment(&saved.id, attachment);
+            }
         }
         let mut state = store.host_snapshot(scope);
         restore(&mut state.sessions, &recovered);
@@ -1466,6 +1531,7 @@ impl Engine {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: false,
                 recovered,
@@ -1510,7 +1576,7 @@ impl Engine {
             ));
         }
         if scope.route.runtime == Runtime::OpenCode {
-            return live.store.dispatch_opencode(id, key, action);
+            return live.store.dispatch_opencode(key, action);
         }
         if let Action::AnswerAsk(ask, choice) = &action
             && let Some(job) = crate::yolo::job_of(ask)
@@ -2170,32 +2236,65 @@ impl Engine {
         }
         let mut created = Vec::new();
         if scope.route.runtime == Runtime::OpenCode {
-            for (client, key, result) in live.store.take_opencode_completions() {
-                match result {
-                    Ok(thread) => {
-                        if let Some(thread) = thread {
-                            self.receipts.opened(scope, &key, &thread);
-                            created.push((
-                                client,
-                                Server::Opened {
-                                    id: key.clone(),
-                                    scope: scope.clone(),
-                                    thread,
-                                },
-                            ));
-                        }
-                        created.push((client, Server::Ack { id: key }));
-                    }
-                    Err(message) => {
-                        let frame = Server::Error {
+            for (key, result) in live.store.take_opencode_completions() {
+                let Some(input) = live.awaiting_input.remove(&key) else {
+                    continue;
+                };
+                let (thread, frame) = match result {
+                    Ok(thread) => (thread, Server::Ack { id: key.clone() }),
+                    Err(message) => (
+                        None,
+                        Server::Error {
                             id: Some(key.clone()),
                             message,
-                        };
-                        self.receipts.finish(scope, &key, frame.clone());
-                        created.push((client, frame));
-                    }
+                        },
+                    ),
+                };
+                self.receipts.insert(
+                    scope.clone(),
+                    key.clone(),
+                    live.generation,
+                    input.digest,
+                    frame.clone(),
+                );
+                if let Some(thread) = thread {
+                    self.receipts.opened(scope, &key, &thread);
+                    created.push((
+                        input.client,
+                        Server::Opened {
+                            id: key,
+                            scope: scope.clone(),
+                            thread,
+                        },
+                    ));
                 }
+                created.push((input.client, frame));
             }
+        } else {
+            live.awaiting_input.retain(|key, input| {
+                let Some(thread) = input.codex_thread.as_deref() else {
+                    return true;
+                };
+                let Some(result) = live.store.take_codex_input_delivery(thread) else {
+                    return true;
+                };
+                let frame = match result {
+                    Ok(()) => Server::Ack { id: key.clone() },
+                    Err(message) => Server::Error {
+                        id: Some(key.clone()),
+                        message,
+                    },
+                };
+                self.receipts.insert(
+                    scope.clone(),
+                    key.clone(),
+                    live.generation,
+                    input.digest,
+                    frame.clone(),
+                );
+                created.push((input.client, frame));
+                false
+            });
         }
         let antigravity = scope.route.runtime == ox_desk_core::runtime::Runtime::Antigravity;
         if let Some(thread) = opened
@@ -3313,9 +3412,7 @@ impl Engine {
         let Some(live) = self.running.get(scope) else {
             return Ok(());
         };
-        let idle = (scope.route.runtime != Runtime::OpenCode
-            || !live.store.opencode_has_pending_requests())
-            && live.store.live_threads().is_empty()
+        let idle = live.store.live_threads().is_empty()
             && live.store.active_turns() == 0
             && live.store.asks().is_empty()
             && !live.store.opening_thread()
@@ -3323,6 +3420,7 @@ impl Engine {
             && live.launching.is_none()
             && live.confirming.is_none()
             && live.opening.is_none()
+            && live.awaiting_input.is_empty()
             && live.terminal.is_none()
             && live.held_handoff.is_none()
             && !self.mode_requests.values().any(|r| &r.scope == scope);
@@ -3865,6 +3963,7 @@ fn restore_row(row: &mut wire::SessionView, saved: &wire::SessionView) {
         "origin",
         "worker_notice",
         "last_result",
+        "memory_attachment",
     ] {
         if row.detail[key].is_null() && !saved.detail[key].is_null() {
             row.detail[key] = saved.detail[key].clone();
@@ -3913,6 +4012,7 @@ mod tests {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: true,
                 recovered: vec![],
@@ -3996,6 +4096,7 @@ mod tests {
                     fork_origin: None,
                     confirming: None,
                     opening: None,
+                    awaiting_input: Default::default(),
                     terminal: None,
                     schema_started: true,
                     recovered: vec![],
@@ -4089,6 +4190,7 @@ mod tests {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: true,
                 recovered: vec![],
@@ -4139,6 +4241,127 @@ mod tests {
             .collect();
         assert!(
             matches!(sent.as_slice(), [Server::Error { .. }, Server::Ack { .. }]),
+            "{sent:?}"
+        );
+    }
+
+    #[test]
+    fn pending_opencode_actions_survive_completed_receipt_eviction_and_device_reconnect() {
+        use ox_desk_core::store::opencode::{Command, Event};
+        let root = tempfile::tempdir().unwrap();
+        let scope = Scope {
+            project: root.path().canonicalize().unwrap(),
+            route: Runtime::OpenCode.route(Some("fixture/model".into())),
+        };
+        let config = RuntimeConfig {
+            ox: "/usr/bin/false".into(),
+            path: "/bin".into(),
+            desktop: root.path().into(),
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel(8);
+        let mut engine = Engine::open(config, root.path(), tx).unwrap();
+        let (send, commands) = std::sync::mpsc::sync_channel(2);
+        let mut store = Store::open_opencode(
+            Profile {
+                project: scope.project.clone(),
+                route: scope.route.clone(),
+                provider: "opencode".into(),
+            },
+            send,
+        );
+        store.apply(LinkEvent::OpenCode(Event::Ready(vec![])));
+        engine.running.insert(
+            scope.clone(),
+            Live {
+                state: store.host_snapshot(&scope),
+                store,
+                launching: None,
+                fork_origin: None,
+                confirming: None,
+                opening: None,
+                awaiting_input: Default::default(),
+                terminal: None,
+                schema_started: true,
+                recovered: vec![],
+                inbox: Inbox::new(|| {}),
+                generation: 1,
+                tokens: HashMap::new(),
+                tracker: Tracker::new(),
+                held_handoff: None,
+            },
+        );
+        let mut connect = |id| {
+            let (peer, frames) = crate::transport::test_peer();
+            engine.clients.insert(
+                id,
+                ClientState {
+                    update_lease: None,
+                    peer,
+                    version: Some(wire::VERSION),
+                    prepared: None,
+                    subscription: Some(Some(scope.clone())),
+                    catalog: false,
+                    watch_resources: false,
+                    terminal: false,
+                    surface: None,
+                },
+            );
+            frames
+        };
+        let old = connect(1);
+        let newer = connect(2);
+        let act = |text: &str| Client::Act {
+            id: "send".into(),
+            scope: scope.clone(),
+            action: Action::SendText(None, text.into()),
+            approval: None,
+        };
+        engine.request(1, act("original")).unwrap();
+        for i in 0..2049 {
+            let key = i.to_string();
+            engine.receipts.insert(
+                scope.clone(),
+                key.clone(),
+                1,
+                [0; 32],
+                Server::Ack { id: key },
+            );
+        }
+        engine.request(2, act("original")).unwrap();
+        engine.request(1, act("original")).unwrap();
+        engine.request(2, act("different")).unwrap();
+        let (key, cmd) = commands.try_recv().unwrap();
+        assert_eq!(key, "send");
+        assert!(matches!(cmd, Command::Send(None, text) if text == "original"));
+        assert!(commands.try_recv().is_err());
+        engine
+            .process(
+                &scope,
+                vec![LinkEvent::OpenCode(Event::Finished {
+                    key,
+                    result: Ok(Some("session".into())),
+                })],
+                false,
+            )
+            .unwrap();
+        let replies = |frames: Receiver<crate::transport::Packet>| {
+            frames
+                .try_iter()
+                .map(|p| serde_json::from_slice::<Server>(&p).unwrap())
+                .filter(|f| !matches!(f, Server::Delta { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            replies(old).is_empty(),
+            "the earlier device cannot retake the receipt"
+        );
+        let sent = replies(newer);
+        assert!(
+            matches!(sent.as_slice(), [
+            Server::Error { message, .. },
+            Server::Opened { thread, .. },
+            Server::Ack { id },
+        ] if message.contains("different request") && thread == "session" && id == "send"),
             "{sent:?}"
         );
     }
@@ -4595,6 +4818,7 @@ mod tests {
                     fork_origin: None,
                     confirming: None,
                     opening: None,
+                    awaiting_input: Default::default(),
                     terminal: None,
                     schema_started: true,
                     recovered: vec![],
@@ -6879,6 +7103,7 @@ mod tests {
                 fork_origin: None,
                 confirming: None,
                 opening: None,
+                awaiting_input: Default::default(),
                 terminal: None,
                 schema_started: true,
                 recovered: vec![],
