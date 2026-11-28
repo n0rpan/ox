@@ -10,13 +10,31 @@ use crate::{
 };
 use std::io;
 
+const UNCONFIRMED_INPUT: &str = "The session changed before Codex confirmed delivery.";
+
 #[derive(Default)]
 pub(super) struct Draft {
     pub text: String,
     images: Vec<crate::mentions::ImageInput>,
     sent: Option<SentInput>,
+    delivery: InputDelivery,
 }
+
+#[derive(Default)]
+enum InputDelivery {
+    #[default]
+    Untracked,
+    Waiting,
+    Complete(Result<(), String>),
+}
+
 impl Draft {
+    fn complete_delivery(&mut self, result: Result<(), String>) {
+        if matches!(self.delivery, InputDelivery::Waiting) {
+            self.delivery = InputDelivery::Complete(result);
+        }
+    }
+
     /// What a delivered copy of this draft looks like in a transcript: trimmed text and
     /// its attachments. A pasted image has no identity the transcript echoes, so two
     /// different pastes look alike (`None`).
@@ -98,6 +116,33 @@ impl Operation {
     }
 }
 impl Store {
+    /// Let the host reply to the submitting connection after Codex confirms this input.
+    /// An existing thread that first needs to resume still uses the existing open flow.
+    pub fn track_codex_input(&mut self, thread: &str) -> bool {
+        if let Some(draft) = self.drafts.get_mut(&Some(thread.to_owned()))
+            && matches!(draft.sent, Some(SentInput::Draft(..)))
+        {
+            draft.delivery = InputDelivery::Waiting;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn take_codex_input_delivery(&mut self, thread: &str) -> Option<Result<(), String>> {
+        match self.drafts.get_mut(&Some(thread.to_owned())) {
+            Some(draft) => match std::mem::take(&mut draft.delivery) {
+                InputDelivery::Waiting => {
+                    draft.delivery = InputDelivery::Waiting;
+                    None
+                }
+                InputDelivery::Complete(result) => Some(result),
+                InputDelivery::Untracked => Some(Err(UNCONFIRMED_INPUT.into())),
+            },
+            None => Some(Err(UNCONFIRMED_INPUT.into())),
+        }
+    }
+
     pub(super) fn worker_notice_id(&self) -> Option<u64> {
         match self.sender {
             Some(crate::surface::Sender::WorkerNotice { id }) => Some(id),
@@ -391,7 +436,7 @@ impl Store {
             Draft {
                 text,
                 images,
-                sent: None,
+                ..Draft::default()
             },
         );
         match self.submit(owner.as_deref()) {
@@ -691,6 +736,7 @@ impl Store {
             let _ = self.stop(id);
         }
         self.cancel_held_resume(id);
+        self.cancel_tracked_codex_input(id);
         if let Some(access) = self.applied_access(Some(id)) {
             self.resume_access.insert(id.into(), access);
         }
@@ -708,6 +754,32 @@ impl Store {
         self.changed.transcript(id);
         self.changed.mark(Changed::THREADS);
         self.request(Call::Unsubscribe(id.into()), Pending::Unsubscribe)
+    }
+
+    fn cancel_tracked_codex_input(&mut self, thread: &str) {
+        if !self
+            .drafts
+            .get(&Some(thread.to_owned()))
+            .is_some_and(|draft| matches!(draft.delivery, InputDelivery::Waiting))
+        {
+            return;
+        }
+        let submission = self.pending.iter().find_map(|(&seq, (_, pending))| {
+            matches!(pending, Pending::Compose(op @ (Operation::Send(_) | Operation::Account(_)))
+                if op.thread() == Some(thread))
+            .then_some(seq)
+        });
+        if let Some(seq) = submission
+            && let Some((_, pending)) = self.pending.remove(&seq)
+        {
+            // A late acceptance must not reactivate an ended session when other
+            // threads keep this app-server alive.
+            self.link.forget(seq);
+            self.failed(
+                pending,
+                "The session ended before Codex confirmed delivery.".into(),
+            );
+        }
     }
     /// Threads with a live process or subscription in this local store. A
     /// Claude process is one session; the blank draft process is not listed.
@@ -853,6 +925,13 @@ impl Store {
                     && let Some(SentInput::Draft(mut sent, mut images)) = d.sent.take()
                     && s.worker_notice.is_none()
                 {
+                    if matches!(d.delivery, InputDelivery::Waiting) {
+                        // The replica keeps its submitted draft and receives the
+                        // private result. Do not restore it to the shared host store
+                        // or project a native error that may echo its content.
+                        d.complete_delivery(Err(reason));
+                        return;
+                    }
                     images.append(&mut d.images);
                     d.images = images;
                     if !d.text.is_empty() {
@@ -956,13 +1035,17 @@ impl Store {
                 if turn.status == "inProgress" && t.last_finished.as_ref() != Some(&turn.id) {
                     t.active_turn = Some(turn.id);
                 }
-                self.drafts.get_mut(&s.owner).unwrap().sent = None;
+                let draft = self.drafts.get_mut(&s.owner).unwrap();
+                draft.sent = None;
+                draft.complete_delivery(Ok(()));
                 Ok(())
             }
             (Operation::Send(s), Reply::Steered(turn))
                 if s.expected_turn.as_ref() == Some(&turn) =>
             {
-                self.drafts.get_mut(&s.owner).unwrap().sent = None;
+                let draft = self.drafts.get_mut(&s.owner).unwrap();
+                draft.sent = None;
+                draft.complete_delivery(Ok(()));
                 Ok(())
             }
             (Operation::Stop(_), Reply::Acknowledged) => Ok(()),
@@ -1230,6 +1313,96 @@ mod tests {
         store.remove_image(None, 0);
         assert_eq!(store.draft_images(None)[0].label(), "second.png");
         assert!(store.draft_images(Some("another-thread")).is_empty());
+    }
+
+    #[test]
+    fn a_tracked_codex_input_reports_the_native_outcome_once() {
+        use crate::codex::reply::TurnStatus;
+        let mut store = ready();
+        let owner = "existing";
+        store.profile.route = Route::codex_api("fixture".into());
+        let thread = store.transcripts.entry(owner.into()).or_default();
+        thread.ready = true;
+        thread.verified = true;
+        for expected in [Err("native rejected the send".to_owned()), Ok(())] {
+            store
+                .send_client_message(Some(owner.into()), "my review draft".into(), vec![])
+                .unwrap();
+            assert!(store.track_codex_input(owner));
+            assert_eq!(store.take_codex_input_delivery(owner), None);
+            let result = match &expected {
+                Ok(()) => Ok(Reply::Turn(TurnStatus {
+                    id: "turn".into(),
+                    status: "inProgress".into(),
+                })),
+                Err(message) => Err(RpcError {
+                    invalid_reply: false,
+                    code: -32603,
+                    message: message.clone(),
+                    data: None,
+                }),
+            };
+            store.apply(LinkEvent::Frame(Frame::Reply {
+                id: RequestId::Number(store.seq),
+                result,
+            }));
+            assert!(store.draft(Some(owner)).is_empty());
+            assert_eq!(store.take_codex_input_delivery(owner), Some(expected));
+            assert_eq!(store.transcript(owner).unwrap().error(), None);
+            assert_eq!(
+                store.take_codex_input_delivery(owner),
+                Some(Err(UNCONFIRMED_INPUT.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn ending_a_tracked_codex_send_ignores_late_account_and_turn_replies() {
+        use crate::codex::reply::TurnStatus;
+        let account =
+            serde_json::from_value(serde_json::json!({"account":{"type":"chatgpt"}})).unwrap();
+        for (route, late_reply) in [
+            (Route::CODEX_SUBSCRIPTION, Reply::Account(account)),
+            (
+                Route::codex_api("fixture".into()),
+                Reply::Turn(TurnStatus {
+                    id: "late-turn".into(),
+                    status: "inProgress".into(),
+                }),
+            ),
+        ] {
+            let mut store = ready();
+            store.profile.route = route;
+            let owner = "ended";
+            for id in [owner, "sibling"] {
+                let thread = store.transcripts.entry(id.into()).or_default();
+                thread.ready = true;
+                thread.verified = true;
+            }
+            store
+                .send_client_message(Some(owner.into()), "review context".into(), vec![])
+                .unwrap();
+            assert!(store.track_codex_input(owner));
+            let send = store.seq;
+            store.edit(Some(owner), "edits made while sending".into());
+            store.end_session(owner).unwrap();
+            assert_eq!(
+                store.take_codex_input_delivery(owner),
+                Some(Err(
+                    "The session ended before Codex confirmed delivery.".into()
+                ))
+            );
+            assert_eq!(store.draft(Some(owner)), "edits made while sending");
+            let sequence_after_end = store.seq;
+            store.apply(LinkEvent::Frame(Frame::Reply {
+                id: RequestId::Number(send),
+                result: Ok(late_reply),
+            }));
+            assert_eq!(store.seq, sequence_after_end);
+            assert!(!store.thread_busy(owner));
+            assert!(!store.has_live_session(owner));
+            assert!(store.has_live_session("sibling"));
+        }
     }
 
     #[test]

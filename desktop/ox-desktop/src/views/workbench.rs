@@ -1153,6 +1153,27 @@ impl Workbench {
             self.pane_width
         };
         let composer = self.composer(detail_width, window, cx);
+        use crate::platform::restore_probe::{self, Milestone};
+        if self.front
+            && let Some(store) = &self.store
+            && let Some(id) = store.selected()
+        {
+            if !narrow_review
+                && !source_reserved
+                && restore_probe::wants(id, Milestone::ComposerReady)
+                && store.can_compose(Some(id))
+            {
+                restore_probe::mark(Milestone::ComposerReady);
+            }
+            if restore_probe::wants(id, Milestone::ThreadLive)
+                && store.state() == &Connection::Ready
+                && store
+                    .transcript(id)
+                    .is_some_and(|t| t.is_ready() && !t.is_loading() && t.error().is_none())
+            {
+                restore_probe::mark(Milestone::ThreadLive);
+            }
+        }
         let terminal = (status == "Connected" && !source_reserved).then(|| {
             let project = self.project.clone();
             crate::kit::icon(
